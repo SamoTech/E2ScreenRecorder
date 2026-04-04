@@ -3,7 +3,7 @@ Version: 1.0.0
 Architecture: all
 Section: extra
 Priority: optional
-Maintainer: SamoTech <info@samotech.dev>
+Maintainer: Ossama Hashim <samo.hossam@gmail.com>
 Description: E2ScreenRecorder - Screenshot & Video Capture for all Enigma2 STBs
  Captures /dev/fb0 on all STB SoC families (BCM, HiSilicon, Amlogic, STi).
  PNG/JPEG/BMP screenshots, MP4/AVI video, built-in WebIF.
