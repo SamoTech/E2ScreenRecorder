@@ -1,10 +1,11 @@
 # E2ScreenRecorder
 
 > **Full-featured Screen Recorder plugin for all Enigma2 STB devices.**  
-> Author: [Ossama Hashim](mailto:samo.hossam@gmail.com) | [SamoTech](https://github.com/SamoTech)
+> Author: [Ossama Hashim](mailto:samo.hossam@gmail.com) &nbsp;|&nbsp; [SamoTech](https://github.com/SamoTech)
 
 Captures `/dev/fb0` framebuffer → **PNG / JPEG / BMP** screenshots and **MP4 / AVI / MKV** video recordings.  
-Includes a **built-in WebIF** — control everything from any browser on your LAN (phone or PC).
+Includes a **built-in WebIF** — control everything from any browser on your LAN (phone or PC).  
+**No ipk. No deb. One command installs everything.**
 
 ---
 
@@ -23,57 +24,33 @@ Includes a **built-in WebIF** — control everything from any browser on your LA
 
 ---
 
-## Installation
+## Install
 
-### Method 1 — opkg (recommended)
+Run this **one command** on the STB (no ipk / no deb required):
 
-```bash
-opkg update
-opkg install enigma2-plugin-extensions-e2screenrecorder_1.0.0_all.ipk
+```sh
+wget -q "--no-check-certificate" https://raw.githubusercontent.com/SamoTech/E2ScreenRecorder/main/install.sh -O - | sh
 ```
 
-### Method 2 — SCP + opkg
+Then restart Enigma2:
 
-```bash
-# From your PC:
-scp enigma2-plugin-extensions-e2screenrecorder_1.0.0_all.ipk root@<STB-IP>:/tmp/
-
-# On the STB:
-opkg install /tmp/enigma2-plugin-extensions-e2screenrecorder_1.0.0_all.ipk
-```
-
-### Method 3 — Manual copy (no ipk)
-
-```bash
-scp -r E2ScreenRecorder/ \
-  root@<STB-IP>:/usr/lib/enigma2/python/Plugins/Extensions/
-
-# Restart Enigma2:
-ssh root@<STB-IP> 'killall -1 enigma2'
+```sh
+killall -1 enigma2
 ```
 
 ---
 
-## Build from Source
+## Uninstall
 
-**Requirements:** `fakeroot`, `dpkg-deb`
-
-```bash
-# Install build deps (Debian/Ubuntu)
-apt install fakeroot dpkg
-
-# Clone the repo
-git clone https://github.com/SamoTech/E2ScreenRecorder.git
-cd E2ScreenRecorder
-
-# Build default version (1.0.0)
-bash build.sh
-
-# Build a custom version
-bash build.sh 1.2.0
+```sh
+wget -q "--no-check-certificate" https://raw.githubusercontent.com/SamoTech/E2ScreenRecorder/main/uninstall.sh -O - | sh
 ```
 
-Output: `enigma2-plugin-extensions-e2screenrecorder_1.0.0_all.ipk`
+Then restart Enigma2:
+
+```sh
+killall -1 enigma2
+```
 
 ---
 
@@ -107,9 +84,9 @@ The WebIF port (default `8765`) is configurable via **Settings** inside the plug
 | OpenBH, OpenSPA | 3.x | Full support |
 | All others | any | Stdlib-only fallback always available |
 
-Install optional enhancements (not required):
+Optional enhancements (not required):
 
-```bash
+```sh
 opkg install python3-pillow ffmpeg
 ```
 
