@@ -3,9 +3,11 @@
 Main Enigma2 Screen class for E2ScreenRecorder.
 All UI operations run in the E2 main thread via eTimer.
 
-Black-screenshot fix integration:
-  _take_screenshot() now calls grab_via_tool() first.
-  Only falls back to raw framebuffer read if grab tool unavailable.
+v1.0.3 changes:
+  - PLUGIN_VERSION shown in screen title and status bar
+  - 'Test Recording (5s)' menu entry for quick video diagnostics
+  - _stop_recording waits up to 3s for thread to finish before
+    clearing the indicator so 'Recording saved' is accurate
 """
 from __future__ import absolute_import, print_function, division
 
@@ -38,30 +40,35 @@ try:
 except Exception:
     HAS_WEBIF = False
 
+PLUGIN_VERSION = "1.0.3"
+
 
 class E2ScreenRecorder(Screen):
 
     skin = """
     <screen name="E2ScreenRecorder" position="center,center"
-            size="620,430" title="Screen Recorder">
-        <widget name="menu"    position="10,10"  size="600,330"
+            size="620,460" title="Screen Recorder v{ver}">
+        <widget name="menu"    position="10,10"  size="600,340"
                 scrollbarMode="showOnDemand"/>
-        <widget name="status"  position="10,355" size="600,35"
-                font="Regular;22"/>
-        <widget name="rec_ind" position="10,395" size="300,28"
+        <widget name="status"  position="10,360" size="600,35"
+                font="Regular;21"/>
+        <widget name="rec_ind" position="10,400" size="300,28"
                 font="Regular;22" foregroundColor="#FF3333"/>
-        <widget name="webif"   position="320,395" size="290,28"
+        <widget name="webif"   position="320,400" size="290,28"
                 font="Regular;18" foregroundColor="#33AAFF"/>
-    </screen>"""
+        <widget name="ver_lbl" position="10,432" size="600,22"
+                font="Regular;16" foregroundColor="#888888"/>
+    </screen>""".format(ver=PLUGIN_VERSION)
 
     def __init__(self, session, args=None):
         Screen.__init__(self, session)
 
-        self._recorder  = None
-        self._rec_start = 0.0
-        self._last_shot = None
-        self._storage   = StorageManager()
-        self._webif     = None
+        self._recorder      = None
+        self._rec_start     = 0.0
+        self._last_shot     = None
+        self._storage       = StorageManager()
+        self._webif         = None
+        self._test_rec_timer = None
 
         # eTimer — compatible with all E2 image variants
         self._rec_timer = eTimer()
@@ -74,23 +81,25 @@ class E2ScreenRecorder(Screen):
                 pass
 
         menu_items = [
-            ("\U0001f4f7  Screenshot (PNG)",         self._screenshot_png),
-            ("\U0001f4f7  Screenshot (JPEG)",        self._screenshot_jpeg),
-            ("\U0001f4f7  Screenshot (BMP)",         self._screenshot_bmp),
-            ("\U0001f5bc   Preview Last Screenshot",  self._preview_last),
-            ("\U0001f3a5  Start Recording",          self._start_recording),
-            ("\u23f9   Stop Recording",              self._stop_recording),
-            ("\U0001f4c2  Show Captures Folder",     self._show_folder),
-            ("\U0001f310  Start WebIF Server",       self._start_webif),
-            ("\u2699\ufe0f   Settings",              self._open_settings),
-            ("\u274c  Exit",                         self.close),
+            ("\U0001f4f7  Screenshot (PNG)",              self._screenshot_png),
+            ("\U0001f4f7  Screenshot (JPEG)",             self._screenshot_jpeg),
+            ("\U0001f4f7  Screenshot (BMP)",              self._screenshot_bmp),
+            ("\U0001f5bc   Preview Last Screenshot",       self._preview_last),
+            ("\U0001f3a5  Start Recording",               self._start_recording),
+            ("\u23f9   Stop Recording",                   self._stop_recording),
+            ("\U0001f9ea  Test Recording (5 sec)",        self._test_recording),
+            ("\U0001f4c2  Show Captures Folder",          self._show_folder),
+            ("\U0001f310  Start WebIF Server",            self._start_webif),
+            ("\u2699\ufe0f   Settings",                   self._open_settings),
+            ("\u274c  Exit",                              self.close),
         ]
 
-        self["menu"]   = MenuList([x[0] for x in menu_items])
-        self["status"] = Label("Ready \u2014 E2ScreenRecorder")
+        self["menu"]    = MenuList([x[0] for x in menu_items])
+        self["status"]  = Label("Ready \u2014 v{}".format(PLUGIN_VERSION))
         self["rec_ind"] = Label("")
-        self["webif"]  = Label("")
-        self._menu_map = menu_items
+        self["webif"]   = Label("")
+        self["ver_lbl"] = Label("E2ScreenRecorder v{}  |  /tmp/E2ScreenRecorder.log".format(PLUGIN_VERSION))
+        self._menu_map  = menu_items
 
         self["actions"] = ActionMap(
             ["OkCancelActions", "DirectionActions"],
@@ -125,13 +134,10 @@ class E2ScreenRecorder(Screen):
             fb   = FramebufferCapture(device=dev)
             path = self._storage.next_screenshot_path(fmt.lower())
 
-            # FIX: try Enigma2 native grab tool first (captures video+OSD composite)
-            #      Only fall back to raw framebuffer read if grab unavailable.
             fb.open()
             grabbed = fb.grab_via_tool(path, jpeg_quality=90)
 
             if not grabbed:
-                # Raw framebuffer path
                 info = fb.get_info()
                 raw  = fb.capture_raw()
                 fb.close()
@@ -139,7 +145,6 @@ class E2ScreenRecorder(Screen):
                 save_screenshot(rgb, info["xres"], info["yres"], path, fmt)
             else:
                 fb.close()
-                # grab wrote a JPEG — if user wants PNG, convert
                 if fmt.upper() == "PNG" and path.endswith(".jpg"):
                     png_path = path.replace(".jpg", ".png")
                     try:
@@ -148,7 +153,7 @@ class E2ScreenRecorder(Screen):
                         os.remove(path)
                         path = png_path
                     except Exception:
-                        pass  # keep the JPEG, it's valid
+                        pass
 
             self._last_shot = path
             self._storage.write_metadata(path, {})
@@ -221,6 +226,8 @@ class E2ScreenRecorder(Screen):
     def _stop_recording(self):
         if self._recorder:
             self._recorder.stop()
+            # Wait up to 3s for the mux thread to finish writing the file
+            self._recorder.join(timeout=3)
             self._recorder = None
         try:
             self._rec_timer.stop()
@@ -230,6 +237,33 @@ class E2ScreenRecorder(Screen):
         self["status"].setText("Recording saved.")
         showNotification("Recording stopped and saved.", timeout=4)
         log.info("Recording stopped.")
+
+    def _test_recording(self):
+        """Record exactly 5 seconds then auto-stop — quick smoke-test for video."""
+        if self._recorder and self._recorder.is_alive():
+            showNotification("Stop current recording first.", timeout=3)
+            return
+        self._start_recording()
+        self["status"].setText("Test recording 5s...")
+        # Use a one-shot eTimer to auto-stop after 5 seconds
+        self._test_stop_timer = eTimer()
+        try:
+            self._test_stop_timer.timeout.append(self._test_recording_stop)
+        except AttributeError:
+            try:
+                self._test_stop_timer.callback.append(self._test_recording_stop)
+            except Exception:
+                pass
+        try:
+            self._test_stop_timer.start(5000, True)  # one-shot
+        except Exception:
+            pass
+
+    def _test_recording_stop(self):
+        self._stop_recording()
+        self["status"].setText("Test done. Check captures folder or WebIF.")
+        showNotification("Test recording complete!\nCheck /tmp/ffmpeg_e2rec.log if no video.", timeout=6)
+        log.info("Test recording auto-stopped after 5s")
 
     def _update_rec_indicator(self):
         if self._recorder and self._recorder.is_alive():
@@ -245,6 +279,7 @@ class E2ScreenRecorder(Screen):
     def _on_record_error(self, msg):
         self["status"].setText("REC Error: " + msg)
         log.error("Recorder error: {}".format(msg))
+        showNotification("Recording error:\n{}\nSee /tmp/ffmpeg_e2rec.log".format(msg), timeout=6)
 
     # ── WebIF ─────────────────────────────────────────────────────────────────
 
