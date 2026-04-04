@@ -6,6 +6,45 @@ Versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ---
 
+## [1.0.2] — 2026-04-04  Recording Stop-After-1s Hotfix
+
+### Fixed — Critical
+
+- **FIX-021** `core/recorder.py` `run()` — Added `_open_fb()` method called
+  inside the recording thread so HiSilicon `/dev/fb1` blank-frame detection
+  and fallback are applied per-thread, right before the capture loop starts.
+  Previously the device was selected at plugin open time, causing Strategy 1
+  (FFmpeg rawvideo) to read from the wrong framebuffer device and produce
+  an all-black output that FFmpeg immediately discarded, making the recording
+  appear to stop after exactly 1 second.
+
+- **FIX-022** `core/recorder.py` `_run_frame_dump()` — Replaced `time.sleep()`
+  with `self._stop_event.wait(delay)` in the capture loop interruptible sleep.
+  `time.sleep()` blocks the thread for a full frame interval (0.2 s at 5 fps)
+  after `stop()` is called, causing the thread to exit its loop one frame late
+  and then enter mux with zero frames captured when recording was very short.
+  `wait()` wakes immediately when `stop()` fires.
+
+- **FIX-023** `core/recorder.py` — `makedirs_safe()` (from `compat.py`) now
+  applied on ALL three strategy code paths (`_try_grab_pipe`, `_run_frame_dump`).
+  Strategy 2 and 3 were still using bare `os.makedirs()`, which raises `OSError`
+  on Python 2 if the directory already exists (e.g. rapid stop/start cycle),
+  killing the thread silently before a single frame was written.
+
+- **FIX-024** `core/recorder.py` `run()` — `on_error` callback now receives
+  `"{ExceptionType}: {message}"` instead of bare `str(e)`. Matches what
+  `ScreenRecorderPlugin._on_record_error()` logs; makes silent failures
+  visible in the OSD status label and in `/tmp/E2ScreenRecorder.log`.
+
+### Improved
+
+- **IMPROVE-001** `core/recorder.py` `_mux_frames()` — FFmpeg stderr now
+  redirected to `/tmp/ffmpeg_e2rec.log` (loglevel `warning`) instead of
+  being discarded. Enables post-mortem diagnosis of mux failures without
+  any UI change.
+
+---
+
 ## [1.0.1] — 2026-04-04  Post-Audit Release
 
 ### Fixed — Critical

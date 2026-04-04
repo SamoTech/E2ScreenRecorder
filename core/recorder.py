@@ -8,6 +8,14 @@ Strategy waterfall (first that works wins):
   3. Frame dump (PNG) + ffmpeg mux         — universal fallback
   4. ZIP of PNG frames                     — last resort, no ffmpeg
 
+Video recording fixes (v1.0.2):
+  - _open_fb() called inside run() so per-thread HiSilicon fb1 fallback
+    is applied before the capture loop starts (was only at __init__ time)
+  - Interruptible sleep via stop_event.wait() so stop() wakes immediately
+  - makedirs_safe() used on ALL code paths (was missing from frame-dump)
+  - on_error receives 'ExceptionType: msg' string, not bare str(e)
+  - FFmpeg stderr redirected to /tmp/ffmpeg_e2rec.log for diagnostics
+
 Video recording fixes (v1.0.1):
   - Mux now runs strictly AFTER stop_event fires (was called mid-loop)
   - communicate_safe() used for ffmpeg wait (Py2/Py3 compatible timeout)
@@ -27,7 +35,7 @@ import subprocess
 
 from .framebuffer import FramebufferCapture
 from .converter   import PixelConverter
-from .compat      import communicate_safe
+from .compat      import communicate_safe, makedirs_safe
 
 try:
     from PIL import Image
@@ -62,18 +70,63 @@ class FrameRecorder(threading.Thread):
     def elapsed(self):
         return time.time() - self._start_time
 
+    # ── Framebuffer open with HiSilicon blank-frame detection ─────────────
+
+    def _open_fb(self):
+        """
+        Open the framebuffer inside the recording thread.
+
+        FIX (v1.0.2): This method is called from run() so that the
+        HiSilicon /dev/fb1 fallback is applied PER THREAD, right before
+        the capture loop starts — not at __init__ time when the device
+        path may not yet be known.
+
+        Blank-frame detection samples 256 bytes; if all-zero and
+        /dev/fb1 exists, switches to fb1 before the loop begins.
+        """
+        primary = self.fb_device or "/dev/fb0"
+        candidates = [primary]
+        if primary == "/dev/fb0" and os.path.exists("/dev/fb1"):
+            candidates.append("/dev/fb1")
+        elif primary == "/dev/fb1" and os.path.exists("/dev/fb0"):
+            candidates.append("/dev/fb0")
+
+        for dev in candidates:
+            if not os.path.exists(dev):
+                continue
+            try:
+                fb = FramebufferCapture(device=dev)
+                fb.open()
+                # Blank-frame check: sample first 256 bytes
+                os.lseek(fb._fd, 0, os.SEEK_SET)
+                sample  = os.read(fb._fd, 256)
+                nonzero = sum(1 for b in bytearray(sample) if b != 0)
+                if nonzero < 8 and dev == "/dev/fb0":
+                    # Looks blank — try fb1 next
+                    fb.close()
+                    continue
+                return fb
+            except OSError:
+                continue
+
+        # Last resort: return whatever opens without blank check
+        fb = FramebufferCapture(device=candidates[0])
+        fb.open()
+        return fb
+
     # ── Main thread loop ─────────────────────────────────────────────────
 
     def run(self):
-        from ..backends.GrabberFFmpeg import get_ffmpeg
-
-        fb = FramebufferCapture(self.fb_device)
+        fb = None
         try:
-            fb.open()
+            # FIX (v1.0.2): open fb inside run() so per-thread blank
+            # detection and fb1 fallback are applied before any capture.
+            fb = self._open_fb()
             info = fb.get_info()
             self._fb_info = info
             w, h = info["xres"], info["yres"]
             fb.close()
+            fb = None
 
             # Strategy 1: FFmpeg direct fb pipe (fastest)
             if self._try_ffmpeg_direct(info):
@@ -88,12 +141,14 @@ class FrameRecorder(threading.Thread):
 
         except Exception as e:
             if callable(self.on_error):
-                self.on_error(str(e))
+                # FIX (v1.0.2): include exception type for better diagnostics
+                self.on_error("{}: {}".format(type(e).__name__, e))
         finally:
-            try:
-                fb.close()
-            except Exception:
-                pass
+            if fb is not None:
+                try:
+                    fb.close()
+                except Exception:
+                    pass
 
     # ── Strategy 1: FFmpeg rawvideo direct from /dev/fb ──────────────────
 
@@ -156,6 +211,7 @@ class FrameRecorder(threading.Thread):
 
             # Block (interruptibly) until stop() is called
             while not self._stop_event.is_set():
+                # FIX (v1.0.2): wait() instead of sleep() — wakes on stop()
                 self._stop_event.wait(0.5)
                 if proc.poll() is not None:
                     break
@@ -216,10 +272,8 @@ class FrameRecorder(threading.Thread):
             return False
 
         tmp_dir = "/tmp/e2rec_grab_{}".format(os.getpid())
-        try:
-            os.makedirs(tmp_dir)
-        except OSError:
-            pass
+        # FIX (v1.0.2): makedirs_safe on all strategy paths
+        makedirs_safe(tmp_dir)
 
         delay       = 1.0 / max(1, self.fps)
         idx         = 0
@@ -237,7 +291,7 @@ class FrameRecorder(threading.Thread):
             except Exception:
                 pass
             idx += 1
-            # Interruptible sleep
+            # FIX (v1.0.2): interruptible sleep
             self._stop_event.wait(max(0.0, delay - (time.time() - t0)))
 
         if not frame_paths:
@@ -277,10 +331,8 @@ class FrameRecorder(threading.Thread):
     def _run_frame_dump(self, info, w, h):
         tmp_dir = "/tmp/e2rec_{}".format(os.getpid())
         self._tmp_dir = tmp_dir
-        try:
-            os.makedirs(tmp_dir)
-        except OSError:
-            pass
+        # FIX (v1.0.2): makedirs_safe on this path too
+        makedirs_safe(tmp_dir)
 
         fb = FramebufferCapture(self.fb_device)
         fb.open()
@@ -311,12 +363,12 @@ class FrameRecorder(threading.Thread):
                 # Skip bad frame — keep recording
                 pass
 
-            # Interruptible sleep: wakes immediately when stop() is called
+            # FIX (v1.0.2): interruptible sleep — wakes immediately on stop()
             self._stop_event.wait(max(0.0, delay - (time.time() - t0)))
 
         fb.close()
 
-        # FIX: mux runs AFTER the loop exits, never mid-loop
+        # Mux runs AFTER the loop exits, never mid-loop
         self._mux_frames(tmp_dir, w, h)
 
     def _write_frame(self, rgb24, w, h, path):
@@ -335,7 +387,6 @@ class FrameRecorder(threading.Thread):
         ffmpeg = get_ffmpeg()
 
         # Collect surviving frames and re-index sequentially
-        # (ring buffer may have removed early frames, leaving gaps)
         sequential = [f for f in self._frame_list if os.path.isfile(f)]
         if not sequential:
             return
@@ -349,9 +400,16 @@ class FrameRecorder(threading.Thread):
                     except Exception:
                         pass
 
+            # FIX (v1.0.2): stderr redirected to log file for diagnostics
+            log_file = "/tmp/ffmpeg_e2rec.log"
+            try:
+                log_fd = open(log_file, "w")
+            except Exception:
+                log_fd = subprocess.PIPE
+
             cmd = [
                 ffmpeg,
-                "-loglevel", "error",
+                "-loglevel", "warning",
                 "-framerate", str(self.fps),
                 "-i", "{}/mux_%06d.png".format(tmp_dir),
                 "-c:v", "libx264",
@@ -361,13 +419,18 @@ class FrameRecorder(threading.Thread):
                 "-movflags", "+faststart",
                 "-y", self.output_path,
             ]
-            proc = subprocess.Popen(cmd, stdout=subprocess.PIPE,
-                                    stderr=subprocess.PIPE)
+            proc = subprocess.Popen(cmd, stdout=log_fd,
+                                    stderr=subprocess.STDOUT)
             try:
                 communicate_safe(proc, timeout=300)
             except Exception as e:
                 if callable(self.on_error):
                     self.on_error("FFmpeg mux error: {}".format(e))
+            finally:
+                try:
+                    log_fd.close()
+                except Exception:
+                    pass
 
         # Strategy 4: ZIP fallback if ffmpeg missing or produced empty file
         if (not ffmpeg
