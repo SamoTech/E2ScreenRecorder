@@ -1,51 +1,36 @@
 # -*- coding: utf-8 -*-
 """
-FFmpeg CLI subprocess backend - video recording from /dev/fb0.
-Auto-discovers ffmpeg binary across all known STB install paths.
+FFmpeg subprocess backend for video recording.
 """
 from __future__ import absolute_import, print_function, division
 
-import os
 import subprocess
+import os
 
-FFMPEG_SEARCH_PATHS = [
+
+FFMPEG_PATHS = [
     "ffmpeg",
     "/usr/bin/ffmpeg",
     "/usr/local/bin/ffmpeg",
     "/opt/bin/ffmpeg",
-    "/usr/sbin/ffmpeg",
-    "/bin/ffmpeg",
+    "/opt/local/bin/ffmpeg",
 ]
 
 
-def _find_ffmpeg():
-    for b in FFMPEG_SEARCH_PATHS:
-        if os.path.sep in b:
-            if os.path.isfile(b) and os.access(b, os.X_OK):
-                return b
-        else:
-            try:
-                subprocess.check_call(
-                    [b, "-version"],
-                    stdout=open(os.devnull, "w"),
-                    stderr=open(os.devnull, "w"),
-                )
-                return b
-            except Exception:
-                continue
-    return None
-
-
-_FFMPEG_BINARY  = None
-_FFMPEG_CHECKED = False
-
-
 def get_ffmpeg():
-    global _FFMPEG_BINARY, _FFMPEG_CHECKED
-    if not _FFMPEG_CHECKED:
-        _FFMPEG_BINARY  = _find_ffmpeg()
-        _FFMPEG_CHECKED = True
-    return _FFMPEG_BINARY
+    """Return path to ffmpeg binary or None."""
+    for b in FFMPEG_PATHS:
+        try:
+            ret = subprocess.call(
+                [b, "-version"],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE
+            )
+            if ret == 0:
+                return b
+        except Exception:
+            continue
+    return None
 
 
 class FFmpegRecorder(object):
@@ -64,31 +49,29 @@ class FFmpegRecorder(object):
 
     def start(self):
         if not self._binary:
-            raise RuntimeError("FFmpeg not found on this device")
-        info  = self.fb_info
-        w, h  = info["xres"], info["yres"]
-        bpp   = info.get("bpp", 32)
+            raise RuntimeError("FFmpeg not found")
+        info = self.fb_info
+        w, h = info["xres"], info["yres"]
+        bpp  = info["bpp"]
         pix_fmt = "bgra" if bpp == 32 else "rgb565le"
         cmd = [
-            self._binary, "-y",
-            "-f",            "rawvideo",
+            self._binary,
+            "-f", "rawvideo",
             "-pixel_format", pix_fmt,
-            "-video_size",   "{}x{}".format(w, h),
-            "-framerate",    str(self.fps),
-            "-i",            "/dev/fb0",
-            "-vf",           "scale={}:{}".format(w, h),
-            "-c:v",          self.codec,
-            "-crf",          str(self.crf),
-            "-preset",       "ultrafast",
-            "-pix_fmt",      "yuv420p",
-            "-movflags",     "+faststart",
-            self.output_path,
+            "-video_size", "{}x{}".format(w, h),
+            "-framerate", str(self.fps),
+            "-i", "/dev/fb0",
+            "-c:v", self.codec,
+            "-crf", str(self.crf),
+            "-preset", "ultrafast",
+            "-pix_fmt", "yuv420p",
+            "-y", self.output_path
         ]
         self._proc = subprocess.Popen(
             cmd,
             stdin=subprocess.PIPE,
-            stdout=open(os.devnull, "w"),
-            stderr=open(os.devnull, "w"),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE
         )
 
     def stop(self):
@@ -98,15 +81,6 @@ class FFmpegRecorder(object):
                 self._proc.stdin.flush()
             except Exception:
                 pass
-            try:
-                self._proc.terminate()
-            except Exception:
-                pass
-            try:
-                self._proc.wait()
-            except Exception:
-                pass
+            self._proc.terminate()
+            self._proc.wait()
             self._proc = None
-
-    def is_running(self):
-        return self._proc is not None and self._proc.poll() is None

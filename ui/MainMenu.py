@@ -8,10 +8,12 @@ from Components.MenuList import MenuList
 
 class MainMenu(Screen):
     skin = """
-    <screen name="MainMenu" position="center,center" size="560,380" title="Screen Recorder">
-        <widget name="menu"   position="10,10"  size="540,300" scrollbarMode="showOnDemand"/>
-        <widget name="hint"   position="10,320" size="540,50"  font="Regular;20"
-                foregroundColor="#aaaaaa"/>
+    <screen name="MainMenu" position="center,center" size="560,380"
+            title="Screen Recorder">
+        <widget name="menu" position="10,10" size="540,300"
+                scrollbarMode="showOnDemand"/>
+        <widget name="hint" position="10,320" size="540,50"
+                font="Regular;20" foregroundColor="#aaaaaa"/>
     </screen>"""
 
     def __init__(self, session, items):

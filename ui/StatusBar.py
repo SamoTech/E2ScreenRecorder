@@ -5,13 +5,13 @@ from Components.Label import Label
 
 
 class StatusBar(Screen):
-    """Minimal OSD overlay showing REC indicator and elapsed time."""
     skin = """
     <screen name="StatusBar" position="30,30" size="280,50"
             flags="wfNoBorder" backgroundColor="#AA000000">
         <widget name="rec" position="5,5" size="270,40"
                 font="Regular;26" foregroundColor="#FF3333"
-                backgroundColor="transparent" valign="center" halign="left"/>
+                backgroundColor="transparent"
+                valign="center" halign="left"/>
     </screen>"""
 
     def __init__(self, session):

@@ -1,7 +1,4 @@
 # -*- coding: utf-8 -*-
-"""
-Full settings ConfigScreen for E2ScreenRecorder.
-"""
 from __future__ import absolute_import, print_function, division
 
 from Screens.Screen import Screen
@@ -13,7 +10,6 @@ from Components.config import (
 )
 from Components.ConfigList import ConfigListScreen
 
-# ── Config tree ─────────────────────────────────────────────────────────────
 config.plugins.E2ScreenRecorder = ConfigSubsection()
 cfg = config.plugins.E2ScreenRecorder
 
@@ -36,9 +32,9 @@ class SettingsScreen(ConfigListScreen, Screen):
     skin = """
     <screen name="SettingsScreen" position="center,center"
             size="640,480" title="Screen Recorder Settings">
-        <widget name="config"  position="10,10"  size="620,420"
+        <widget name="config" position="10,10" size="620,420"
                 scrollbarMode="showOnDemand"/>
-        <widget name="hint"    position="10,440" size="620,30"
+        <widget name="hint"   position="10,440" size="620,30"
                 font="Regular;18" foregroundColor="#888888"/>
     </screen>"""
 
@@ -49,7 +45,6 @@ class SettingsScreen(ConfigListScreen, Screen):
             ["OkCancelActions", "DirectionActions"],
             {"ok": self._save, "cancel": self.close,
              "up": self.keyUp, "down": self.keyDown}, -1)
-
         self._entries = [
             getConfigListEntry("Screenshot Format",     cfg.screenshot_fmt),
             getConfigListEntry("JPEG Quality (%)",      cfg.jpeg_quality),
