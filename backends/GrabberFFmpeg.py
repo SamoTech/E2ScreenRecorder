@@ -15,7 +15,19 @@ Module-level helper:
 All stderr is redirected to /tmp/ffmpeg_e2rec.log so operators can diagnose
 problems without attaching a debugger to the STB.
 
-Python 2.7 – 3.12+ compatible.  No f-strings. No walrus. No match.
+Python 2.7 - 3.12+ compatible.  No f-strings. No walrus. No match.
+
+Fixes applied (2026-04-04, real-device test on Cortex-A15 / FFmpeg 8.0):
+  - Timestamp jumps: fbdev uses wall-clock PTS causing time to go backward
+    then jump forward.  Fixed with -vsync cfr + setpts=N/(fps*TB).
+  - Corrupt MP4 on kill: moov atom only written at end; first 25s show
+    size=0KiB then a sudden 256KiB flush.  Fixed with movflags
+    +faststart+frag_keyframe+empty_moov.
+  - probesize warning on every start: suppressed with -probesize 32
+    -fpsprobesize 0.
+  - Cortex-A15 libx264 warmup latency: explicit x264-params disables
+    cabac, bframes, aq, trellis, scenecut — not useful without NEON asm
+    and only add overhead on this CPU class.
 """
 from __future__ import absolute_import, print_function, division
 
@@ -35,8 +47,15 @@ _FFMPEG_BINS = [
     "/opt/bin/ffmpeg",
     "/opt/local/bin/ffmpeg",
 ]
-_FFMPEG_LOG  = "/tmp/ffmpeg_e2rec.log"
+_FFMPEG_LOG   = "/tmp/ffmpeg_e2rec.log"
 _STOP_TIMEOUT = 5           # seconds before SIGKILL after SIGTERM
+
+# x264 parameter string tuned for Cortex-A15 with --disable-inline-asm.
+# Disables analysis features that require NEON/asm to be worthwhile.
+_X264_PARAMS_FAST = (
+    "ref=1:bframes=0:aq-mode=0:me=dia:subme=0"
+    ":trellis=0:scenecut=0:cabac=0"
+)
 
 
 # ── Binary discovery ───────────────────────────────────────────────────
@@ -72,6 +91,18 @@ class FFmpegGrabber(object):
     Streams a framebuffer device directly to a video file using
     ``-f fbdev``.  Runs FFmpeg in a daemon thread.
 
+    Fixes vs. original:
+      * -probesize 32 -fpsprobesize 0  suppress the 'not enough frames'
+        warning that appeared on every recording start.
+      * -vsync cfr + setpts filter     correct PTS so timestamps never
+        go backward (fbdev wall-clock drift on Cortex-A15).
+      * -movflags +faststart+frag_keyframe+empty_moov
+                                       write a valid moov atom from frame 1
+                                       so the file is playable even if the
+                                       process is killed mid-recording.
+      * -x264-params _X264_PARAMS_FAST disable analysis modes that only
+                                       hurt performance without NEON asm.
+
     Logs all FFmpeg stderr output to ``/tmp/ffmpeg_e2rec.log``.
     """
 
@@ -88,6 +119,45 @@ class FFmpegGrabber(object):
 
     # ─ internal -------------------------------------------------------
 
+    def _build_cmd(self):
+        fps = str(self.framerate)
+        cmd = [
+            self._binary,
+            # ── Input ──────────────────────────────────────────────
+            # Suppress 'not enough frames to estimate rate' warning.
+            "-probesize",    "32",
+            "-fpsprobesize", "0",
+            "-f",            "fbdev",
+            "-framerate",    fps,
+            "-i",            self.device_path,
+            # ── Timestamp fix ──────────────────────────────────────
+            # fbdev stamps frames with wall-clock time; on Cortex-A15
+            # scheduling jitter causes PTS to jump backward then forward.
+            # -vsync cfr forces constant frame rate in the muxer;
+            # setpts rebuilds PTS from the frame counter so the output
+            # timeline is always monotonically increasing.
+            "-vsync",        "cfr",
+            "-vf",           "setpts=N/({fps}*TB)".format(fps=fps),
+            # ── Encoding ───────────────────────────────────────────
+            "-c:v",          "libx264",
+            "-preset",       "ultrafast",
+            "-profile:v",    "baseline",
+            "-level",        "3.1",
+            "-pix_fmt",      "yuv420p",
+            # Cortex-A15 tuning: disable analysis that needs NEON asm.
+            "-x264-params",  _X264_PARAMS_FAST,
+            # ── Output: safe fragmented MP4 ────────────────────────
+            # faststart    : move moov to front for progressive play
+            # frag_keyframe: flush a fragment at every keyframe so the
+            #                file is valid even after an unclean stop
+            # empty_moov   : write an empty moov before any frames so
+            #                players can open the file immediately
+            "-movflags",     "+faststart+frag_keyframe+empty_moov",
+            "-y",
+            self.output_path,
+        ]
+        return cmd
+
     def _run_ffmpeg(self):
         if not self._binary:
             msg = "FFmpegGrabber: no ffmpeg binary available"
@@ -95,17 +165,7 @@ class FFmpegGrabber(object):
             self._append_log("FATAL: " + msg + "\n")
             return
 
-        cmd = [
-            self._binary,
-            "-f",         "fbdev",
-            "-framerate", str(self.framerate),
-            "-i",         self.device_path,
-            "-c:v",       "libx264",
-            "-preset",    "ultrafast",
-            "-pix_fmt",   "yuv420p",
-            "-y",
-            self.output_path,
-        ]
+        cmd = self._build_cmd()
         log.info("[FFmpegGrabber] {}".format(" ".join(cmd)))
 
         try:
@@ -152,7 +212,7 @@ class FFmpegGrabber(object):
                 self.process.wait(timeout=_STOP_TIMEOUT)
             except Exception:
                 # subprocess.TimeoutExpired on Py3; on Py2 wait() has no timeout
-                # — handle both gracefully.
+                # - handle both gracefully.
                 try:
                     self.process.kill()
                     log.warning(
@@ -172,6 +232,9 @@ class FFmpegRecorder(object):
     Muxes a sequence of PNG frames from a temp directory into an output
     video file.  Used by FrameRecorder._mux_frames() as a synchronous
     one-shot call (blocking until mux is done).
+
+    Applies the same movflags fix as FFmpegGrabber so the muxed file is
+    safe against unclean process termination.
     """
 
     def __init__(self, fb_info, output_path, fps=5, codec="libx264", crf=28):
@@ -187,8 +250,8 @@ class FFmpegRecorder(object):
 
     def mux_frames(self, frame_pattern):
         """
-        Mux PNG frames matching ``frame_pattern`` (e.g. ``/tmp/e2rec_123/%06d.png``)
-        into ``self.output_path``.
+        Mux PNG frames matching ``frame_pattern``
+        (e.g. ``/tmp/e2rec_123/%06d.png``) into ``self.output_path``.
 
         Returns True on success, False on failure.
         All FFmpeg output is appended to ``_FFMPEG_LOG``.
@@ -197,15 +260,20 @@ class FFmpegRecorder(object):
             log.warning("[FFmpegRecorder] ffmpeg not available; skipping mux")
             return False
 
-        info = self.fb_info
+        fps_str = str(self.fps)
         cmd = [
             self._binary,
-            "-framerate", str(self.fps),
+            "-framerate", fps_str,
             "-i",         frame_pattern,
             "-c:v",       self.codec,
             "-pix_fmt",   "yuv420p",
             "-crf",       str(self.crf),
             "-preset",    "ultrafast",
+            "-profile:v", "baseline",
+            "-level",     "3.1",
+            "-x264-params", _X264_PARAMS_FAST,
+            # Safe fragmented MP4 — same fix as FFmpegGrabber
+            "-movflags",  "+faststart+frag_keyframe+empty_moov",
             "-y",
             self.output_path,
         ]
@@ -221,7 +289,7 @@ class FFmpegRecorder(object):
                 )
             if ret != 0:
                 log.error(
-                    "[FFmpegRecorder] ffmpeg exited {} — see {}".format(
+                    "[FFmpegRecorder] ffmpeg exited {} - see {}".format(
                         ret, _FFMPEG_LOG))
                 return False
             return True
