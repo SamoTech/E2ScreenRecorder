@@ -5,6 +5,7 @@ from Components.Label import Label
 
 
 class StatusBar(Screen):
+    """Minimal OSD overlay showing REC indicator and elapsed time."""
     skin = """
     <screen name="StatusBar" position="30,30" size="280,50"
             flags="wfNoBorder" backgroundColor="#AA000000">

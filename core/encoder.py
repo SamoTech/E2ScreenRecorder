@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-Backend dispatcher - selects the best available encoder at runtime.
+Backend dispatcher — selects the best available encoder at runtime.
 """
 from __future__ import absolute_import, print_function, division
 

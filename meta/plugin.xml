@@ -4,13 +4,12 @@
     packagename="enigma2-plugin-extensions-e2screenrecorder"
     category="Utility"
     version="1.0.0"
-    author="SamoTech"
+    author="Ossama Hashim / SamoTech"
     website="https://github.com/SamoTech/E2ScreenRecorder">
   <description>
     Full-featured Screen Recorder for all Enigma2 STBs.
-    Screenshots (PNG/JPEG/BMP) and video recording (MP4/AVI/MKV)
-    from /dev/fb0 framebuffer. Built-in WebIF for remote control
-    from any phone or PC on the LAN.
+    Screenshots (PNG/JPEG/BMP) and video recording (MP4/AVI).
+    Built-in WebIF for remote control from any browser on the LAN.
     Zero mandatory dependencies. Python 2.7-3.12+ compatible.
   </description>
   <compatibility minversion="2016-06-01"/>

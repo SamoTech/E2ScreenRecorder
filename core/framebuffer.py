@@ -1,8 +1,9 @@
 # -*- coding: utf-8 -*-
 """
 Framebuffer capture via Linux ioctl.
-Handles: double-buffering (yoffset), blank /dev/fb0 -> fallback /dev/fb1,
-         mmap failure fallback, Python 2/3, all known STB FB variants.
+Works on all known STB framebuffer implementations.
+Auto-detects blank /dev/fb0 (HiSilicon) and falls back to /dev/fb1.
+Handles yoffset double-buffering and chunked reads for Python 2 safety.
 """
 from __future__ import absolute_import, print_function, division
 
@@ -11,47 +12,38 @@ import struct
 import fcntl
 import array
 
-from .compat import makedirs_safe
-
 FBIOGET_VSCREENINFO = 0x4600
 FBIOGET_FSCREENINFO = 0x4602
 
 VSCREENINFO_FMT = (
-    "<"
     "II"       # xres, yres
     "II"       # xres_virtual, yres_virtual
     "II"       # xoffset, yoffset
     "I"        # bits_per_pixel
     "I"        # grayscale
-    "HHH"      # red:   offset, length, msb_right
-    "x"
+    "HHH"      # red: offset, length, msb_right
     "HHH"      # green: offset, length, msb_right
-    "x"
-    "HHH"      # blue:  offset, length, msb_right
-    "x"
-    "HHH"      # transp
-    "x"
+    "HHH"      # blue: offset, length, msb_right
+    "HHH"      # transp: offset, length, msb_right
     "I"        # nonstd
     "I"        # activate
     "II"       # height_mm, width_mm
     "I"        # accel_flags
-    "IIIIIII"  # timings
-    "I"        # sync
-    "I"        # vmode
+    "IIIIIII"  # pixclock, margins, sync, vmode
     "I"        # rotate
     "I"        # colorspace
-    "III"      # reserved[3]
+    "III"      # reserved
 )
 
-VSCREENINFO_SIZE = struct.calcsize(VSCREENINFO_FMT)
+CHUNK_SIZE = 64 * 1024  # 64 KB — avoids Python 2 single-read limit
 
 
 class FramebufferCapture(object):
 
-    DEVICES = ["/dev/fb0", "/dev/fb1"]
+    FALLBACK_DEVICES = ["/dev/fb0", "/dev/fb1"]
 
     def __init__(self, device=None):
-        self.device   = device
+        self.device   = device  # None = auto-detect
         self._fd      = None
         self._fb_info = {}
 
@@ -59,59 +51,58 @@ class FramebufferCapture(object):
         if self.device:
             self._open_device(self.device)
         else:
-            self._auto_detect()
+            self._auto_open()
 
-    def _open_device(self, dev):
-        self._fd = os.open(dev, os.O_RDONLY)
-        self._read_vscreeninfo()
-        self.device = dev
-
-    def _auto_detect(self):
-        for dev in self.DEVICES:
+    def _auto_open(self):
+        """Try /dev/fb0 first; fall back to /dev/fb1 if blank (HiSilicon)."""
+        last_exc = None
+        for dev in self.FALLBACK_DEVICES:
             if not os.path.exists(dev):
                 continue
             try:
                 self._open_device(dev)
+                # Check if framebuffer is blank
+                info = self._fb_info
+                probe_size = min(256, info["xres"] * (info["bpp"] // 8))
                 os.lseek(self._fd, 0, os.SEEK_SET)
-                sample = os.read(self._fd, 256)
-                if sample and any(b != 0 for b in bytearray(sample)):
-                    return
+                sample = os.read(self._fd, probe_size)
+                if any(b != 0 for b in bytearray(sample)):
+                    return  # non-blank — use this device
+                # blank frame — close and try next
                 os.close(self._fd)
                 self._fd = None
-            except (OSError, IOError):
+            except Exception as e:
+                last_exc = e
                 if self._fd is not None:
                     try:
                         os.close(self._fd)
                     except Exception:
                         pass
                     self._fd = None
-                continue
-        if self._fd is None:
+        # All blank or failed — fall back to /dev/fb0
+        try:
             self._open_device("/dev/fb0")
+        except Exception:
+            if last_exc:
+                raise last_exc
+            raise IOError("No framebuffer device available")
+
+    def _open_device(self, dev):
+        self.device = dev
+        self._fd = os.open(dev, os.O_RDONLY)
+        self._read_vscreeninfo()
 
     def _read_vscreeninfo(self):
-        buf = array.array('B', [0] * max(VSCREENINFO_SIZE, 160))
-        try:
-            fcntl.ioctl(self._fd, FBIOGET_VSCREENINFO, buf, True)
-        except Exception:
-            pass
-        raw = buf.tobytes() if hasattr(buf, 'tobytes') else buf.tostring()
-        if len(raw) < VSCREENINFO_SIZE:
-            raw = raw + b'\x00' * (VSCREENINFO_SIZE - len(raw))
-        try:
-            fields = struct.unpack_from(VSCREENINFO_FMT, raw)
-        except struct.error:
-            fields = (1280, 720, 1280, 720, 0, 0, 32, 0,
-                      16, 8, 0, 8, 8, 0, 0, 8, 0, 24, 8, 0)
+        buf = array.array('B', [0] * 160)
+        fcntl.ioctl(self._fd, FBIOGET_VSCREENINFO, buf, True)
+        raw    = buf.tobytes()
+        fields = struct.unpack_from("<" + VSCREENINFO_FMT, raw)
         self._fb_info = {
-            "xres":         fields[0]  or 1280,
-            "yres":         fields[1]  or 720,
-            "xres_virtual": fields[2]  or fields[0] or 1280,
-            "yres_virtual": fields[3]  or fields[1] or 720,
+            "xres":         fields[0],
+            "yres":         fields[1],
             "xoffset":      fields[4],
             "yoffset":      fields[5],
-            "bpp":          fields[6]  or 32,
-            "grayscale":    fields[7],
+            "bpp":          fields[6],
             "red_offset":   fields[8],
             "red_len":      fields[9],
             "green_offset": fields[11],
@@ -123,18 +114,20 @@ class FramebufferCapture(object):
         }
 
     def capture_raw(self):
-        info     = self._fb_info
-        stride   = info["xres"] * (info["bpp"] // 8)
-        yoffset  = info["yoffset"]
-        byte_off = yoffset * stride
+        """Return raw framebuffer bytes for the visible page (handles yoffset)."""
+        info      = self._fb_info
+        stride    = info["xres"] * (info["bpp"] // 8)
         byte_size = info["xres"] * info["yres"] * (info["bpp"] // 8)
-        os.lseek(self._fd, byte_off, os.SEEK_SET)
-        CHUNK = 65536
+        offset    = info.get("yoffset", 0) * stride
+
+        os.lseek(self._fd, offset, os.SEEK_SET)
+
+        # Chunked read — safe on Python 2 with large buffers
         chunks = []
         remaining = byte_size
         while remaining > 0:
-            read_size = min(CHUNK, remaining)
-            chunk = os.read(self._fd, read_size)
+            to_read = min(CHUNK_SIZE, remaining)
+            chunk   = os.read(self._fd, to_read)
             if not chunk:
                 break
             chunks.append(chunk)
@@ -146,8 +139,5 @@ class FramebufferCapture(object):
 
     def close(self):
         if self._fd is not None:
-            try:
-                os.close(self._fd)
-            except Exception:
-                pass
+            os.close(self._fd)
             self._fd = None

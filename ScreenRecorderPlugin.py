@@ -8,7 +8,7 @@ from __future__ import absolute_import, print_function, division
 import os
 import time
 
-from Screens.Screen  import Screen
+from Screens.Screen import Screen
 from Components.ActionMap import ActionMap
 from Components.Label import Label
 from Components.MenuList import MenuList
@@ -59,6 +59,7 @@ class E2ScreenRecorder(Screen):
         self._storage     = StorageManager()
         self._webif       = None
 
+        # eTimer — compatible with all E2 image variants
         self._rec_timer = eTimer()
         try:
             self._rec_timer.timeout.append(self._update_rec_indicator)
@@ -69,16 +70,16 @@ class E2ScreenRecorder(Screen):
                 pass
 
         menu_items = [
-            ("\U0001f4f7  Screenshot (PNG)",          self._screenshot_png),
-            ("\U0001f4f7  Screenshot (JPEG)",         self._screenshot_jpeg),
-            ("\U0001f4f7  Screenshot (BMP)",          self._screenshot_bmp),
-            ("\U0001f5bc   Preview Last Screenshot",   self._preview_last),
-            ("\U0001f3a5  Start Recording",           self._start_recording),
-            ("\u23f9   Stop Recording",            self._stop_recording),
-            ("\U0001f4c2  Show Captures Folder",      self._show_folder),
-            ("\U0001f310  Start WebIF Server",        self._start_webif),
-            ("\u2699\ufe0f   Settings",                 self._open_settings),
-            ("\u274c  Exit",                       self.close),
+            ("\U0001f4f7  Screenshot (PNG)",         self._screenshot_png),
+            ("\U0001f4f7  Screenshot (JPEG)",        self._screenshot_jpeg),
+            ("\U0001f4f7  Screenshot (BMP)",         self._screenshot_bmp),
+            ("\U0001f5bc   Preview Last Screenshot",  self._preview_last),
+            ("\U0001f3a5  Start Recording",          self._start_recording),
+            ("\u23f9   Stop Recording",              self._stop_recording),
+            ("\U0001f4c2  Show Captures Folder",     self._show_folder),
+            ("\U0001f310  Start WebIF Server",       self._start_webif),
+            ("\u2699\ufe0f   Settings",              self._open_settings),
+            ("\u274c  Exit",                         self.close),
         ]
 
         self["menu"]    = MenuList([x[0] for x in menu_items])
@@ -96,28 +97,37 @@ class E2ScreenRecorder(Screen):
 
         self.onShow.append(self._on_show)
 
+    # ── Lifecycle ───────────────────────────────────────────────────────────
+
     def _on_show(self):
         if cfg and cfg.webif_enabled.value and HAS_WEBIF:
             self._start_webif(silent=True)
+
+    # ── Menu dispatch ───────────────────────────────────────────────────────
 
     def _menu_selected(self):
         idx = self["menu"].getSelectedIndex()
         if 0 <= idx < len(self._menu_map):
             self._menu_map[idx][1]()
 
+    # ── Screenshot ──────────────────────────────────────────────────────────
+
     def _take_screenshot(self, fmt="PNG"):
         try:
             dev = None
             if cfg and cfg.fb_device.value != "auto":
                 dev = cfg.fb_device.value
+
             fb = FramebufferCapture(device=dev)
             fb.open()
             info = fb.get_info()
             raw  = fb.capture_raw()
             fb.close()
+
             rgb  = PixelConverter.to_rgb24(raw, info)
             path = self._storage.next_screenshot_path(fmt.lower())
             save_screenshot(rgb, info["xres"], info["yres"], path, fmt)
+
             self._last_shot = path
             self._storage.write_metadata(path, {
                 "width": info["xres"], "height": info["yres"],
@@ -134,6 +144,8 @@ class E2ScreenRecorder(Screen):
     def _screenshot_png(self):   self._take_screenshot("PNG")
     def _screenshot_jpeg(self):  self._take_screenshot("JPEG")
     def _screenshot_bmp(self):   self._take_screenshot("BMP")
+
+    # ── Preview ─────────────────────────────────────────────────────────────
 
     def _preview_last(self):
         if self._last_shot and os.path.isfile(self._last_shot):
@@ -154,27 +166,35 @@ class E2ScreenRecorder(Screen):
             else:
                 self["status"].setText("No screenshots found")
 
+    # ── Recording ───────────────────────────────────────────────────────────
+
     def _start_recording(self):
         if self._recorder and self._recorder.is_alive():
             showNotification("Recording already in progress!", timeout=3)
             return
+
         fps     = int(cfg.video_fps.value) if cfg else 5
         fmt     = cfg.video_fmt.value      if cfg else "mp4"
         low_ram = cfg.low_ram_mode.value   if cfg else False
-        dev     = (cfg.fb_device.value if cfg and cfg.fb_device.value != "auto" else None)
+        dev     = (cfg.fb_device.value if cfg and cfg.fb_device.value != "auto"
+                   else None)
+
         path = self._storage.next_video_path(fmt)
         self._recorder  = FrameRecorder(
             output_path=path, fps=fps, fmt=fmt,
             fb_device=dev, on_error=self._on_record_error, low_ram=low_ram)
         self._rec_start = time.time()
         self._recorder.start()
+
         if cfg and cfg.show_rec_osd.value:
             self["rec_ind"].setText("\u25cf REC  00:00")
         self["status"].setText("Recording: " + os.path.basename(path))
+
         try:
             self._rec_timer.start(1000, False)
         except Exception:
             pass
+
         showNotification("Recording started...", timeout=2)
         log.info("Recording started \u2192 {}".format(path))
 
@@ -182,10 +202,12 @@ class E2ScreenRecorder(Screen):
         if self._recorder:
             self._recorder.stop()
             self._recorder = None
+
         try:
             self._rec_timer.stop()
         except Exception:
             pass
+
         self["rec_ind"].setText("")
         self["status"].setText("Recording saved.")
         showNotification("Recording stopped and saved.", timeout=4)
@@ -205,6 +227,8 @@ class E2ScreenRecorder(Screen):
     def _on_record_error(self, msg):
         self["status"].setText("REC Error: " + msg)
         log.error("Recorder error: {}".format(msg))
+
+    # ── WebIF ────────────────────────────────────────────────────────────────
 
     def _start_webif(self, silent=False):
         if not HAS_WEBIF:
@@ -247,8 +271,10 @@ class E2ScreenRecorder(Screen):
         except Exception:
             return "STB-IP"
 
+    # ── Misc ────────────────────────────────────────────────────────────────
+
     def _show_folder(self):
-        base = StorageManager()._get_base()
+        base = self._storage._get_base()
         self["status"].setText("Folder: " + base)
         showNotification("Captures stored in:\n{}".format(base), timeout=5)
 

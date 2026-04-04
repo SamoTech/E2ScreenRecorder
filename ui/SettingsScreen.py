@@ -13,22 +13,23 @@ from Components.config import (
 )
 from Components.ConfigList import ConfigListScreen
 
+# ── Config tree ─────────────────────────────────────────────────────────────
 config.plugins.E2ScreenRecorder = ConfigSubsection()
 cfg = config.plugins.E2ScreenRecorder
 
-cfg.screenshot_fmt = ConfigSelection(default="PNG",
+cfg.screenshot_fmt  = ConfigSelection(default="PNG",
     choices=["PNG", "JPEG", "BMP", "PPM"])
-cfg.jpeg_quality   = ConfigInteger(default=85, limits=(10, 100))
-cfg.video_fps      = ConfigSelection(default="5",
+cfg.jpeg_quality    = ConfigInteger(default=85, limits=(10, 100))
+cfg.video_fps       = ConfigSelection(default="5",
     choices=["1", "2", "5", "10", "15", "25"])
-cfg.video_fmt      = ConfigSelection(default="mp4",
+cfg.video_fmt       = ConfigSelection(default="mp4",
     choices=["mp4", "avi", "mkv", "ts"])
-cfg.fb_device      = ConfigSelection(default="auto",
+cfg.fb_device       = ConfigSelection(default="auto",
     choices=["auto", "/dev/fb0", "/dev/fb1"])
-cfg.low_ram_mode   = ConfigYesNo(default=False)
-cfg.webif_enabled  = ConfigYesNo(default=True)
-cfg.webif_port     = ConfigInteger(default=8765, limits=(1024, 65535))
-cfg.show_rec_osd   = ConfigYesNo(default=True)
+cfg.low_ram_mode    = ConfigYesNo(default=False)
+cfg.webif_enabled   = ConfigYesNo(default=True)
+cfg.webif_port      = ConfigInteger(default=8765, limits=(1024, 65535))
+cfg.show_rec_osd    = ConfigYesNo(default=True)
 
 
 class SettingsScreen(ConfigListScreen, Screen):
@@ -48,16 +49,17 @@ class SettingsScreen(ConfigListScreen, Screen):
             ["OkCancelActions", "DirectionActions"],
             {"ok": self._save, "cancel": self.close,
              "up": self.keyUp, "down": self.keyDown}, -1)
+
         self._entries = [
-            getConfigListEntry("Screenshot Format",      cfg.screenshot_fmt),
-            getConfigListEntry("JPEG Quality (%)",       cfg.jpeg_quality),
-            getConfigListEntry("Video FPS",              cfg.video_fps),
-            getConfigListEntry("Video Format",           cfg.video_fmt),
-            getConfigListEntry("Framebuffer Device",     cfg.fb_device),
-            getConfigListEntry("Low RAM Mode (<256MB)",  cfg.low_ram_mode),
-            getConfigListEntry("WebIF Enabled",          cfg.webif_enabled),
-            getConfigListEntry("WebIF Port",             cfg.webif_port),
-            getConfigListEntry("Show REC OSD",           cfg.show_rec_osd),
+            getConfigListEntry("Screenshot Format",     cfg.screenshot_fmt),
+            getConfigListEntry("JPEG Quality (%)",      cfg.jpeg_quality),
+            getConfigListEntry("Video FPS",             cfg.video_fps),
+            getConfigListEntry("Video Format",          cfg.video_fmt),
+            getConfigListEntry("Framebuffer Device",    cfg.fb_device),
+            getConfigListEntry("Low RAM Mode (<256MB)", cfg.low_ram_mode),
+            getConfigListEntry("WebIF Enabled",         cfg.webif_enabled),
+            getConfigListEntry("WebIF Port",            cfg.webif_port),
+            getConfigListEntry("Show REC OSD",          cfg.show_rec_osd),
         ]
         ConfigListScreen.__init__(self, self._entries, session=session)
 

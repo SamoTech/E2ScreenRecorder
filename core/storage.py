@@ -1,14 +1,9 @@
 # -*- coding: utf-8 -*-
-"""
-StorageManager - resolves best writable output path,
-checks quota, writes metadata sidecar files.
-"""
 from __future__ import absolute_import, print_function, division
 
 import os
 import time
-
-from .compat import makedirs_safe
+import json
 
 
 class StorageManager(object):
@@ -17,33 +12,23 @@ class StorageManager(object):
         "/media/hdd/screenshots",
         "/media/usb/screenshots",
         "/media/mmc/screenshots",
-        "/media/cf/screenshots",
         "/tmp/screenshots",
     ]
-
-    MIN_FREE_BYTES = 5 * 1024 * 1024
-
-    def _free_space(self, path):
-        try:
-            st = os.statvfs(path)
-            return st.f_bavail * st.f_frsize
-        except Exception:
-            return 0
 
     def _get_base(self):
         for path in self.SEARCH_PATHS:
             parent = os.path.dirname(path)
-            is_acceptable = (parent == "/tmp" or
-                             os.path.ismount(parent) or
-                             os.path.ismount(os.path.dirname(parent)))
-            if not is_acceptable:
-                continue
-            makedirs_safe(path)
-            if os.path.isdir(path) and os.access(path, os.W_OK):
-                if self._free_space(path) >= self.MIN_FREE_BYTES:
+            if os.path.ismount(parent) or parent == "/tmp":
+                if not os.path.exists(path):
+                    try:
+                        os.makedirs(path)
+                    except OSError:
+                        continue
+                if os.access(path, os.W_OK):
                     return path
         fallback = "/tmp/screenshots"
-        makedirs_safe(fallback)
+        if not os.path.exists(fallback):
+            os.makedirs(fallback)
         return fallback
 
     def _timestamp(self):
@@ -57,29 +42,37 @@ class StorageManager(object):
         base = self._get_base()
         return os.path.join(base, "rec_{}.{}".format(self._timestamp(), ext))
 
-    def write_metadata(self, media_path, info):
+    def write_metadata(self, capture_path, meta):
+        """Write a sidecar .json next to the capture file."""
         try:
-            import json
-            meta_path = media_path + ".json"
-            with __import__('io').open(meta_path, "w", encoding="utf-8") as f:
-                json.dump(info, f, indent=2)
+            meta_path = capture_path + ".json"
+            meta["timestamp"] = self._timestamp()
+            with open(meta_path, "w") as f:
+                json.dump(meta, f)
         except Exception:
             pass
 
     def list_captures(self):
-        captures = []
-        for path in self.SEARCH_PATHS + ["/tmp/screenshots"]:
-            if not os.path.isdir(path):
-                continue
-            for fname in os.listdir(path):
-                if fname.startswith(("shot_", "rec_")):
-                    full = os.path.join(path, fname)
+        """Return list of capture dicts sorted newest-first."""
+        base = self._get_base()
+        items = []
+        try:
+            for name in os.listdir(base):
+                if name.endswith(".json"):
+                    continue
+                path = os.path.join(base, name)
+                if os.path.isfile(path):
                     try:
-                        size  = os.path.getsize(full)
-                        mtime = os.path.getmtime(full)
-                        captures.append({"path": full, "name": fname,
-                                         "size": size, "mtime": mtime})
+                        st = os.stat(path)
+                        items.append({
+                            "name": name,
+                            "path": path,
+                            "size": st.st_size,
+                            "mtime": int(st.st_mtime),
+                        })
                     except OSError:
                         pass
-        captures.sort(key=lambda x: x["mtime"], reverse=True)
-        return captures
+        except OSError:
+            pass
+        items.sort(key=lambda x: x["mtime"], reverse=True)
+        return items

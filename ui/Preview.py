@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-Thumbnail preview screen.
+Thumbnail preview screen — shows last captured screenshot on OSD.
 """
 from __future__ import absolute_import, print_function, division
 

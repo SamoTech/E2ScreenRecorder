@@ -22,7 +22,157 @@ except ImportError:                 # Python 2
 from ..utils.logger import log
 
 
-_WEBIF_HTML = r"""<!DOCTYPE html>
+class _Handler(BaseHTTPRequestHandler):
+
+    def log_message(self, fmt, *args):
+        log.debug("WebIF: " + fmt % args)
+
+    def do_GET(self):
+        parsed = urlparse(self.path)
+        path   = parsed.path.rstrip("/") or "/"
+        params = parse_qs(parsed.query)
+
+        if path == "/":
+            self._serve_html()
+        elif path == "/api/status":
+            self._serve_status()
+        elif path == "/api/screenshot":
+            fmt = params.get("fmt", ["PNG"])[0].upper()
+            self._api_screenshot(fmt)
+        elif path == "/api/start":
+            self._api_start()
+        elif path == "/api/stop":
+            self._api_stop()
+        elif path == "/api/captures":
+            self._api_captures()
+        elif path.startswith("/download/"):
+            self._serve_file(path[len("/download/"):])
+        else:
+            self._send_json({"error": "not found"}, 404)
+
+    # ── API handlers ────────────────────────────────────────────────────────
+
+    def _api_screenshot(self, fmt="PNG"):
+        try:
+            self.server._ctx["do_screenshot"](fmt)
+            self._send_json({"ok": True, "fmt": fmt})
+        except Exception as e:
+            self._send_json({"error": str(e)}, 500)
+
+    def _api_start(self):
+        try:
+            self.server._ctx["do_start_rec"]()
+            self._send_json({"ok": True, "recording": True})
+        except Exception as e:
+            self._send_json({"error": str(e)}, 500)
+
+    def _api_stop(self):
+        try:
+            self.server._ctx["do_stop_rec"]()
+            self._send_json({"ok": True, "recording": False})
+        except Exception as e:
+            self._send_json({"error": str(e)}, 500)
+
+    def _serve_status(self):
+        rec = self.server._ctx["get_recorder"]()
+        is_recording = rec is not None and rec.is_alive()
+        elapsed = 0
+        if is_recording and hasattr(rec, "elapsed"):
+            elapsed = int(rec.elapsed())
+        captures = self.server._ctx["storage"].list_captures()
+        self._send_json({
+            "recording": is_recording,
+            "elapsed":   elapsed,
+            "captures":  len(captures),
+        })
+
+    def _api_captures(self):
+        items = self.server._ctx["storage"].list_captures()
+        self._send_json({"captures": items[:50]})
+
+    def _serve_file(self, name):
+        storage = self.server._ctx["storage"]
+        for item in storage.list_captures():
+            if item["name"] == name:
+                try:
+                    with open(item["path"], "rb") as f:
+                        data = f.read()
+                    ext  = name.rsplit(".", 1)[-1].lower()
+                    mime = {
+                        "png": "image/png", "jpg": "image/jpeg",
+                        "jpeg": "image/jpeg", "mp4": "video/mp4",
+                        "avi": "video/avi", "mkv": "video/webm",
+                        "zip": "application/zip"
+                    }.get(ext, "application/octet-stream")
+                    self.send_response(200)
+                    self.send_header("Content-Type", mime)
+                    self.send_header("Content-Length", str(len(data)))
+                    self.send_header("Content-Disposition",
+                                     'attachment; filename="{}"'.format(name))
+                    self.end_headers()
+                    self.wfile.write(data)
+                    return
+                except Exception as e:
+                    self._send_json({"error": str(e)}, 500)
+                    return
+        self._send_json({"error": "file not found"}, 404)
+
+    # ── Helpers ─────────────────────────────────────────────────────────────
+
+    def _send_json(self, obj, code=200):
+        body = json.dumps(obj).encode("utf-8")
+        self.send_response(code)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Access-Control-Allow-Origin", "*")
+        self.end_headers()
+        self.wfile.write(body)
+
+    def _serve_html(self):
+        html = _WEBIF_HTML.encode("utf-8")
+        self.send_response(200)
+        self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.send_header("Content-Length", str(len(html)))
+        self.end_headers()
+        self.wfile.write(html)
+
+
+# ── Server class ────────────────────────────────────────────────────────────
+
+class WebIFServer(threading.Thread):
+
+    def __init__(self, port, storage, get_recorder,
+                 do_screenshot, do_start_rec, do_stop_rec):
+        super(WebIFServer, self).__init__()
+        self.daemon = True
+        self._port  = port
+        self._ctx   = {
+            "storage":       storage,
+            "get_recorder":  get_recorder,
+            "do_screenshot": do_screenshot,
+            "do_start_rec":  do_start_rec,
+            "do_stop_rec":   do_stop_rec,
+        }
+        self._httpd = None
+
+    def is_running(self):
+        return self._httpd is not None
+
+    def run(self):
+        self._httpd = HTTPServer(("0.0.0.0", self._port), _Handler)
+        self._httpd._ctx = self._ctx
+        log.info("WebIF listening on 0.0.0.0:{}".format(self._port))
+        self._httpd.serve_forever()
+
+    def stop(self):
+        if self._httpd:
+            self._httpd.shutdown()
+            self._httpd = None
+
+
+# ── Embedded WebIF SPA ───────────────────────────────────────────────────────
+
+_WEBIF_HTML = """<!DOCTYPE html>
 <html lang="en" data-theme="dark">
 <head>
 <meta charset="UTF-8">
@@ -125,8 +275,8 @@ main{max-width:960px;margin:0 auto;padding:24px 16px;
   </div>
   <div class="header-actions">
     <button class="btn-ghost btn-sm" id="themeToggle" aria-label="Toggle theme"
-      onclick="toggleTheme()">&#9790;</button>
-    <button class="btn-ghost btn-sm" onclick="refreshAll()">&#8635; Refresh</button>
+      onclick="toggleTheme()">🌙</button>
+    <button class="btn-ghost btn-sm" onclick="refreshAll()">↻ Refresh</button>
   </div>
 </header>
 
@@ -134,9 +284,9 @@ main{max-width:960px;margin:0 auto;padding:24px 16px;
   <div class="card">
     <h2>Status</h2>
     <div class="status-grid">
-      <div class="stat"><div class="stat-val" id="recStatus">&#8212;</div><div class="stat-lbl">Recording</div></div>
-      <div class="stat"><div class="stat-val" id="elapsed">&#8212;</div><div class="stat-lbl">Elapsed</div></div>
-      <div class="stat"><div class="stat-val" id="capCount">&#8212;</div><div class="stat-lbl">Captures</div></div>
+      <div class="stat"><div class="stat-val" id="recStatus">—</div><div class="stat-lbl">Recording</div></div>
+      <div class="stat"><div class="stat-val" id="elapsed">—</div><div class="stat-lbl">Elapsed</div></div>
+      <div class="stat"><div class="stat-val" id="capCount">—</div><div class="stat-lbl">Captures</div></div>
     </div>
   </div>
 
@@ -148,22 +298,22 @@ main{max-width:960px;margin:0 auto;padding:24px 16px;
       <button class="fmt-btn" data-fmt="BMP">BMP</button>
     </div>
     <div class="actions-row">
-      <button class="btn-primary" onclick="takeScreenshot()">&#128247; Take Screenshot</button>
+      <button class="btn-primary" onclick="takeScreenshot()">&#x1F4F7; Take Screenshot</button>
     </div>
   </div>
 
   <div class="card">
     <h2>Video Recording</h2>
     <div class="actions-row">
-      <button class="btn-primary" id="btnStart" onclick="startRec()">&#127909; Start Recording</button>
-      <button class="btn-danger"  id="btnStop"  onclick="stopRec()">&#9209; Stop Recording</button>
+      <button class="btn-primary" id="btnStart" onclick="startRec()">&#x1F3A5; Start Recording</button>
+      <button class="btn-danger"  id="btnStop"  onclick="stopRec()">&#x23F9; Stop Recording</button>
     </div>
   </div>
 
   <div class="card">
     <h2>Captures</h2>
     <div class="captures-list" id="capturesList">
-      <div class="empty-state">Loading captures&#8230;</div>
+      <div class="empty-state">Loading captures…</div>
     </div>
   </div>
 </main>
@@ -176,14 +326,14 @@ let _fmt='PNG';
 document.querySelectorAll('.fmt-btn').forEach(b=>{
   b.addEventListener('click',()=>{
     document.querySelectorAll('.fmt-btn').forEach(x=>x.classList.remove('active'));
-    b.classList.add('active'); _fmt=b.dataset.fmt;
+    b.classList.add('active');_fmt=b.dataset.fmt;
   });
 });
 function toggleTheme(){
   const h=document.documentElement;
   const t=h.getAttribute('data-theme')==='dark'?'light':'dark';
   h.setAttribute('data-theme',t);
-  document.getElementById('themeToggle').textContent=t==='dark'?'\u263D':'\u2600';
+  document.getElementById('themeToggle').textContent=t==='dark'?'\ud83c\udf19':'\u2600\ufe0f';
 }
 async function api(url){
   try{const r=await fetch(url,{cache:'no-store'});return await r.json();}
@@ -191,186 +341,62 @@ async function api(url){
 }
 function toast(msg,type='ok'){
   const el=document.getElementById('toast');
-  el.textContent=msg; el.className='toast '+type+' show';
+  el.textContent=msg;el.className='toast '+type+' show';
   setTimeout(()=>el.classList.remove('show'),3500);
 }
 async function takeScreenshot(){
   const r=await api('/api/screenshot?fmt='+_fmt);
-  if(r.ok)toast('\uD83D\uDCF7 Screenshot saved ('+_fmt+')','ok');
+  if(r.ok)toast('\ud83d\udcf7 Screenshot saved ('+_fmt+')','ok');
   else toast('Error: '+(r.error||'?'),'err');
   setTimeout(loadCaptures,800);
 }
 async function startRec(){
   const r=await api('/api/start');
-  if(r.ok)toast('\uD83C\uDFA5 Recording started','ok');
+  if(r.ok)toast('\ud83c\udfa5 Recording started','ok');
   else toast('Error: '+(r.error||'?'),'err');
   updateStatus();
 }
 async function stopRec(){
   const r=await api('/api/stop');
-  if(r.ok)toast('\u23F9 Recording stopped and saved','ok');
+  if(r.ok)toast('\u23f9 Recording stopped and saved','ok');
   else toast('Error: '+(r.error||'?'),'err');
-  updateStatus(); setTimeout(loadCaptures,1200);
+  updateStatus();setTimeout(loadCaptures,1200);
 }
 function fmtTime(s){const m=Math.floor(s/60),sec=s%60;return String(m).padStart(2,'0')+':'+String(sec).padStart(2,'0');}
+function fmtBytes(b){if(b<1024)return b+'B';if(b<1048576)return(b/1024).toFixed(1)+'KB';return(b/1048576).toFixed(1)+'MB';}
 async function updateStatus(){
   const d=await api('/api/status');
   if(d.error){document.getElementById('recStatus').textContent='ERR';return;}
-  const el=document.getElementById('recStatus');
-  el.innerHTML=d.recording?'<span class="rec-badge"><span class="dot"></span>REC</span>':'Idle';
-  document.getElementById('elapsed').textContent=d.recording?fmtTime(d.elapsed):'\u2014';
+  const recEl=document.getElementById('recStatus');
+  recEl.innerHTML=d.recording?'<span class="rec-badge"><span class="dot"></span>REC</span>':'Idle';
+  document.getElementById('elapsed').textContent=d.recording?fmtTime(d.elapsed):'—';
   document.getElementById('capCount').textContent=d.captures;
 }
-function fmtBytes(b){if(b<1024)return b+'B';if(b<1048576)return(b/1024).toFixed(1)+'KB';return(b/1048576).toFixed(1)+'MB';}
 async function loadCaptures(){
   const d=await api('/api/captures');
   const el=document.getElementById('capturesList');
-  if(!d.captures||!d.captures.length){el.innerHTML='<div class="empty-state">No captures yet. Take a screenshot or record a video!</div>';return;}
+  if(!d.captures||!d.captures.length){
+    el.innerHTML='<div class="empty-state">No captures yet. Take a screenshot or record a video!</div>';return;
+  }
   el.innerHTML=d.captures.map(c=>{
     const date=new Date(c.mtime*1000).toLocaleString();
-    const icon=c.name.startsWith('shot_')?'\uD83D\uDDBC':'\uD83C\uDFA5';
-    return `<div class="capture-item"><div class="cap-info"><div class="cap-name">${icon} ${c.name}</div><div class="cap-meta">${fmtBytes(c.size)} &bull; ${date}</div></div><div class="cap-actions"><a href="/download/${encodeURIComponent(c.name)}" download><button class="btn-ghost btn-sm">&#11015; Download</button></a></div></div>`;
+    const icon=c.name.startsWith('shot_')?'\ud83d\uddbc':'\ud83c\udfa5';
+    return `<div class="capture-item">
+      <div class="cap-info">
+        <div class="cap-name">${icon} ${c.name}</div>
+        <div class="cap-meta">${fmtBytes(c.size)} &bull; ${date}</div>
+      </div>
+      <div class="cap-actions">
+        <a href="/download/${encodeURIComponent(c.name)}" download>
+          <button class="btn-ghost btn-sm">&#x2B07; Download</button>
+        </a>
+      </div>
+    </div>`;
   }).join('');
 }
 function refreshAll(){updateStatus();loadCaptures();toast('Refreshed','ok');}
-setInterval(updateStatus,2000);
-updateStatus(); loadCaptures();
+function startPolling(){updateStatus();loadCaptures();setInterval(updateStatus,2000);}
+startPolling();
 </script>
 </body>
 </html>"""
-
-
-class _Handler(BaseHTTPRequestHandler):
-
-    def log_message(self, fmt, *args):
-        log.debug("WebIF: " + fmt % args)
-
-    def do_GET(self):
-        parsed = urlparse(self.path)
-        path   = parsed.path.rstrip("/") or "/"
-        params = parse_qs(parsed.query)
-
-        if path == "/":
-            self._serve_html()
-        elif path == "/api/status":
-            self._serve_status()
-        elif path == "/api/screenshot":
-            fmt = params.get("fmt", ["PNG"])[0].upper()
-            self._api_screenshot(fmt)
-        elif path == "/api/start":
-            self._api_start()
-        elif path == "/api/stop":
-            self._api_stop()
-        elif path == "/api/captures":
-            self._api_captures()
-        elif path.startswith("/download/"):
-            self._serve_file(path[len("/download/"):])
-        else:
-            self._send_json({"error": "not found"}, 404)
-
-    def _api_screenshot(self, fmt="PNG"):
-        try:
-            self.server._ctx["do_screenshot"](fmt)
-            self._send_json({"ok": True, "fmt": fmt})
-        except Exception as e:
-            self._send_json({"error": str(e)}, 500)
-
-    def _api_start(self):
-        try:
-            self.server._ctx["do_start_rec"]()
-            self._send_json({"ok": True, "recording": True})
-        except Exception as e:
-            self._send_json({"error": str(e)}, 500)
-
-    def _api_stop(self):
-        try:
-            self.server._ctx["do_stop_rec"]()
-            self._send_json({"ok": True, "recording": False})
-        except Exception as e:
-            self._send_json({"error": str(e)}, 500)
-
-    def _serve_status(self):
-        rec = self.server._ctx["get_recorder"]()
-        is_recording = rec is not None and rec.is_alive()
-        elapsed = 0
-        if is_recording and hasattr(rec, "elapsed"):
-            elapsed = int(rec.elapsed())
-        captures = self.server._ctx["storage"].list_captures()
-        self._send_json({"recording": is_recording, "elapsed": elapsed, "captures": len(captures)})
-
-    def _api_captures(self):
-        items = self.server._ctx["storage"].list_captures()
-        self._send_json({"captures": items[:50]})
-
-    def _serve_file(self, name):
-        storage = self.server._ctx["storage"]
-        for item in storage.list_captures():
-            if item["name"] == name:
-                try:
-                    with open(item["path"], "rb") as f:
-                        data = f.read()
-                    ext  = name.rsplit(".", 1)[-1].lower()
-                    mime = {"png": "image/png", "jpg": "image/jpeg",
-                            "jpeg": "image/jpeg", "mp4": "video/mp4",
-                            "avi": "video/avi", "mkv": "video/webm",
-                            "zip": "application/zip"}.get(ext, "application/octet-stream")
-                    self.send_response(200)
-                    self.send_header("Content-Type", mime)
-                    self.send_header("Content-Length", str(len(data)))
-                    self.send_header("Content-Disposition",
-                                     'attachment; filename="{}"'.format(name))
-                    self.end_headers()
-                    self.wfile.write(data)
-                    return
-                except Exception as e:
-                    self._send_json({"error": str(e)}, 500)
-                    return
-        self._send_json({"error": "file not found"}, 404)
-
-    def _send_json(self, obj, code=200):
-        body = json.dumps(obj).encode("utf-8")
-        self.send_response(code)
-        self.send_header("Content-Type", "application/json")
-        self.send_header("Content-Length", str(len(body)))
-        self.send_header("Access-Control-Allow-Origin", "*")
-        self.end_headers()
-        self.wfile.write(body)
-
-    def _serve_html(self):
-        html = _WEBIF_HTML.encode("utf-8")
-        self.send_response(200)
-        self.send_header("Content-Type", "text/html; charset=utf-8")
-        self.send_header("Content-Length", str(len(html)))
-        self.end_headers()
-        self.wfile.write(html)
-
-
-class WebIFServer(threading.Thread):
-
-    def __init__(self, port, storage, get_recorder,
-                 do_screenshot, do_start_rec, do_stop_rec):
-        super(WebIFServer, self).__init__()
-        self.daemon = True
-        self._port  = port
-        self._ctx   = {
-            "storage":       storage,
-            "get_recorder":  get_recorder,
-            "do_screenshot": do_screenshot,
-            "do_start_rec":  do_start_rec,
-            "do_stop_rec":   do_stop_rec,
-        }
-        self._httpd = None
-
-    def is_running(self):
-        return self._httpd is not None
-
-    def run(self):
-        self._httpd = HTTPServer(("0.0.0.0", self._port), _Handler)
-        self._httpd._ctx = self._ctx
-        log.info("WebIF listening on 0.0.0.0:{}".format(self._port))
-        self._httpd.serve_forever()
-
-    def stop(self):
-        if self._httpd:
-            self._httpd.shutdown()
-            self._httpd = None
