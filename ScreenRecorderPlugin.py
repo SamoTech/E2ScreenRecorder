@@ -1,14 +1,14 @@
 # -*- coding: utf-8 -*-
-"""
-Main Enigma2 Screen class for E2ScreenRecorder.
-All UI operations run in the E2 main thread via eTimer.
-"""
+# v1.0.1 — post-audit patch
+# Fixes: FIX-004 (eTimer/recorder cleanup on close),
+#        FIX-013 (JPEG fallback notification when Pillow absent),
+#        FIX-014 (guard against None recorder in _stop_recording)
 from __future__ import absolute_import, print_function, division
 
 import os
 import time
 
-from Screens.Screen import Screen
+from Screens.Screen   import Screen
 from Components.ActionMap import ActionMap
 from Components.Label import Label
 from Components.MenuList import MenuList
@@ -21,6 +21,12 @@ from .core.storage     import StorageManager
 from .core.encoder     import save_screenshot
 from .utils.logger     import log
 from .utils.notify     import showNotification
+
+try:
+    from PIL import Image as _PIL
+    HAS_PIL = True
+except ImportError:
+    HAS_PIL = False
 
 try:
     from .ui.SettingsScreen import SettingsScreen, cfg
@@ -53,13 +59,12 @@ class E2ScreenRecorder(Screen):
     def __init__(self, session, args=None):
         Screen.__init__(self, session)
 
-        self._recorder    = None
-        self._rec_start   = 0.0
-        self._last_shot   = None
-        self._storage     = StorageManager()
-        self._webif       = None
+        self._recorder  = None
+        self._rec_start = 0.0
+        self._last_shot = None
+        self._storage   = StorageManager()
+        self._webif     = None
 
-        # eTimer — compatible with all E2 image variants
         self._rec_timer = eTimer()
         try:
             self._rec_timer.timeout.append(self._update_rec_indicator)
@@ -70,20 +75,20 @@ class E2ScreenRecorder(Screen):
                 pass
 
         menu_items = [
-            ("\U0001f4f7  Screenshot (PNG)",         self._screenshot_png),
-            ("\U0001f4f7  Screenshot (JPEG)",        self._screenshot_jpeg),
-            ("\U0001f4f7  Screenshot (BMP)",         self._screenshot_bmp),
+            ("\U0001f4f7  Screenshot (PNG)",          self._screenshot_png),
+            ("\U0001f4f7  Screenshot (JPEG)",         self._screenshot_jpeg),
+            ("\U0001f4f7  Screenshot (BMP)",          self._screenshot_bmp),
             ("\U0001f5bc   Preview Last Screenshot",  self._preview_last),
-            ("\U0001f3a5  Start Recording",          self._start_recording),
-            ("\u23f9   Stop Recording",              self._stop_recording),
-            ("\U0001f4c2  Show Captures Folder",     self._show_folder),
-            ("\U0001f310  Start WebIF Server",       self._start_webif),
-            ("\u2699\ufe0f   Settings",              self._open_settings),
-            ("\u274c  Exit",                         self.close),
+            ("\U0001f3a5  Start Recording",           self._start_recording),
+            ("\u23f9   Stop Recording",               self._stop_recording),
+            ("\U0001f4c2  Show Captures Folder",      self._show_folder),
+            ("\U0001f310  Start WebIF Server",        self._start_webif),
+            ("\u2699\ufe0f   Settings",               self._open_settings),
+            ("\u274c  Exit",                          self.close),
         ]
 
         self["menu"]    = MenuList([x[0] for x in menu_items])
-        self["status"]  = Label("Ready \u2014 E2ScreenRecorder")
+        self["status"]  = Label("Ready — E2ScreenRecorder v1.0.1")
         self["rec_ind"] = Label("")
         self["webif"]   = Label("")
         self._menu_map  = menu_items
@@ -97,32 +102,45 @@ class E2ScreenRecorder(Screen):
 
         self.onShow.append(self._on_show)
 
-    # ── Lifecycle ───────────────────────────────────────────────────────────
+    # ── FIX-004: clean up eTimer and recorder on screen close ────────────
+    def onClose(self):
+        """FIX-004: stop eTimer and recorder before widgets are destroyed."""
+        try:
+            self._rec_timer.stop()   # FIX-004: prevent callback on dead widget
+        except Exception:
+            pass
+        if self._recorder and self._recorder.is_alive():  # FIX-004
+            try:
+                self._recorder.stop()
+            except Exception:
+                pass
+        if self._webif:
+            try:
+                self._webif.stop()
+            except Exception:
+                pass
 
+    # ── Lifecycle ────────────────────────────────────────────────────────
     def _on_show(self):
         if cfg and cfg.webif_enabled.value and HAS_WEBIF:
             self._start_webif(silent=True)
 
-    # ── Menu dispatch ───────────────────────────────────────────────────────
-
+    # ── Menu ─────────────────────────────────────────────────────────────
     def _menu_selected(self):
         idx = self["menu"].getSelectedIndex()
         if 0 <= idx < len(self._menu_map):
             self._menu_map[idx][1]()
 
-    # ── Screenshot ──────────────────────────────────────────────────────────
-
+    # ── Screenshot ───────────────────────────────────────────────────────
     def _take_screenshot(self, fmt="PNG"):
         try:
             dev = None
             if cfg and cfg.fb_device.value != "auto":
                 dev = cfg.fb_device.value
 
-            fb = FramebufferCapture(device=dev)
-            fb.open()
-            info = fb.get_info()
-            raw  = fb.capture_raw()
-            fb.close()
+            with FramebufferCapture(device=dev) as fb:  # FIX-003: context mgr
+                info = fb.get_info()
+                raw  = fb.capture_raw()
 
             rgb  = PixelConverter.to_rgb24(raw, info)
             path = self._storage.next_screenshot_path(fmt.lower())
@@ -141,33 +159,37 @@ class E2ScreenRecorder(Screen):
             self["status"].setText("Error: " + str(e))
             log.error("Screenshot failed: {}".format(e))
 
-    def _screenshot_png(self):   self._take_screenshot("PNG")
-    def _screenshot_jpeg(self):  self._take_screenshot("JPEG")
-    def _screenshot_bmp(self):   self._take_screenshot("BMP")
+    def _screenshot_png(self):  self._take_screenshot("PNG")
+    def _screenshot_bmp(self):  self._take_screenshot("BMP")
 
-    # ── Preview ─────────────────────────────────────────────────────────────
+    def _screenshot_jpeg(self):
+        # FIX-013: JPEG requires Pillow; notify user and fall back to PPM
+        if not HAS_PIL:  # FIX-013
+            log.warn("JPEG requested but Pillow not installed — saving PPM")
+            showNotification(
+                "JPEG needs Pillow (python3-pillow).\nSaving as PPM instead.",
+                timeout=5)
+            self._take_screenshot("PPM")  # FIX-013: graceful fallback
+            return
+        self._take_screenshot("JPEG")
 
+    # ── Preview ──────────────────────────────────────────────────────────
     def _preview_last(self):
-        if self._last_shot and os.path.isfile(self._last_shot):
+        target = self._last_shot
+        if not target or not os.path.isfile(target):
+            captures = self._storage.list_captures()
+            shots = [c for c in captures if c["name"].startswith("shot_")]
+            target = shots[0]["path"] if shots else None
+        if target:
             try:
                 from .ui.Preview import Preview
-                self.session.open(Preview, self._last_shot)
+                self.session.open(Preview, target)
             except Exception:
                 self["status"].setText("Preview unavailable")
         else:
-            captures = self._storage.list_captures()
-            shots = [c for c in captures if c["name"].startswith("shot_")]
-            if shots:
-                try:
-                    from .ui.Preview import Preview
-                    self.session.open(Preview, shots[0]["path"])
-                except Exception:
-                    pass
-            else:
-                self["status"].setText("No screenshots found")
+            self["status"].setText("No screenshots found")
 
-    # ── Recording ───────────────────────────────────────────────────────────
-
+    # ── Recording ────────────────────────────────────────────────────────
     def _start_recording(self):
         if self._recorder and self._recorder.is_alive():
             showNotification("Recording already in progress!", timeout=3)
@@ -176,8 +198,8 @@ class E2ScreenRecorder(Screen):
         fps     = int(cfg.video_fps.value) if cfg else 5
         fmt     = cfg.video_fmt.value      if cfg else "mp4"
         low_ram = cfg.low_ram_mode.value   if cfg else False
-        dev     = (cfg.fb_device.value if cfg and cfg.fb_device.value != "auto"
-                   else None)
+        dev     = (cfg.fb_device.value
+                   if cfg and cfg.fb_device.value != "auto" else None)
 
         path = self._storage.next_video_path(fmt)
         self._recorder  = FrameRecorder(
@@ -199,9 +221,20 @@ class E2ScreenRecorder(Screen):
         log.info("Recording started \u2192 {}".format(path))
 
     def _stop_recording(self):
-        if self._recorder:
-            self._recorder.stop()
+        # FIX-014: guard against None recorder
+        if not self._recorder:  # FIX-014
+            self["status"].setText("No active recording.")
+            return
+
+        # FIX-014: also handle orphaned (dead) thread
+        if not self._recorder.is_alive():  # FIX-014
             self._recorder = None
+            self["rec_ind"].setText("")
+            self["status"].setText("No active recording.")
+            return
+
+        self._recorder.stop()
+        self._recorder = None
 
         try:
             self._rec_timer.stop()
@@ -228,12 +261,11 @@ class E2ScreenRecorder(Screen):
         self["status"].setText("REC Error: " + msg)
         log.error("Recorder error: {}".format(msg))
 
-    # ── WebIF ────────────────────────────────────────────────────────────────
-
+    # ── WebIF ─────────────────────────────────────────────────────────────
     def _start_webif(self, silent=False):
         if not HAS_WEBIF:
             if not silent:
-                self["status"].setText("WebIF not available (missing deps)")
+                self["status"].setText("WebIF not available")
             return
         if self._webif and self._webif.is_running():
             if not silent:
@@ -271,8 +303,7 @@ class E2ScreenRecorder(Screen):
         except Exception:
             return "STB-IP"
 
-    # ── Misc ────────────────────────────────────────────────────────────────
-
+    # ── Misc ─────────────────────────────────────────────────────────────
     def _show_folder(self):
         base = self._storage._get_base()
         self["status"].setText("Folder: " + base)

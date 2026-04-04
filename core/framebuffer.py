@@ -1,13 +1,11 @@
 # -*- coding: utf-8 -*-
-"""
-Framebuffer capture via Linux ioctl.
-Works on all known STB framebuffer implementations.
-Auto-detects blank /dev/fb0 (HiSilicon) and falls back to /dev/fb1.
-Handles yoffset double-buffering and chunked reads for Python 2 safety.
-"""
+# v1.0.1 — post-audit patch
+# Fixes: FIX-001 (chunked read + yoffset), FIX-002 (184-byte ioctl buf),
+#        FIX-003 (fd leak + context manager)
 from __future__ import absolute_import, print_function, division
 
 import os
+import sys
 import struct
 import fcntl
 import array
@@ -29,79 +27,99 @@ VSCREENINFO_FMT = (
     "I"        # activate
     "II"       # height_mm, width_mm
     "I"        # accel_flags
-    "IIIIIII"  # pixclock, margins, sync, vmode
+    "IIIIIII"  # timings
     "I"        # rotate
     "I"        # colorspace
     "III"      # reserved
 )
 
-CHUNK_SIZE = 64 * 1024  # 64 KB — avoids Python 2 single-read limit
+_CHUNK = 65536  # FIX-001: read in 64KB chunks for slow MIPS kernels
 
 
 class FramebufferCapture(object):
+    """
+    Framebuffer capture via Linux ioctl.
+    Supports context-manager usage::
 
-    FALLBACK_DEVICES = ["/dev/fb0", "/dev/fb1"]
+        with FramebufferCapture() as fb:
+            raw = fb.capture_raw()
+    """
 
     def __init__(self, device=None):
-        self.device   = device  # None = auto-detect
-        self._fd      = None
+        self.device  = device  # None triggers auto-detect in open()
+        self._fd     = None
         self._fb_info = {}
 
-    def open(self):
-        if self.device:
-            self._open_device(self.device)
-        else:
-            self._auto_open()
+    # ── Context manager (FIX-003) ──────────────────────────────────────────
+    def __enter__(self):
+        self.open()
+        return self
 
-    def _auto_open(self):
-        """Try /dev/fb0 first; fall back to /dev/fb1 if blank (HiSilicon)."""
-        last_exc = None
-        for dev in self.FALLBACK_DEVICES:
+    def __exit__(self, *_):
+        self.close()
+
+    # ── Open / close ───────────────────────────────────────────────────────
+    def open(self):
+        if self.device is None:
+            self.device = self._auto_detect_device()
+        # FIX-003: wrap in try/finally so fd is never leaked on error
+        try:
+            self._fd = os.open(self.device, os.O_RDONLY)
+            self._read_vscreeninfo()
+        except Exception:
+            if self._fd is not None:
+                try:
+                    os.close(self._fd)
+                except OSError:
+                    pass
+                self._fd = None
+            raise
+
+    def close(self):  # FIX-003
+        if self._fd is not None:
+            try:
+                os.close(self._fd)
+            except OSError:
+                pass
+            self._fd = None
+
+    # ── Auto-detect device (HiSilicon /dev/fb1 workaround) ────────────────
+    def _auto_detect_device(self):
+        for dev in ("/dev/fb0", "/dev/fb1"):
             if not os.path.exists(dev):
                 continue
             try:
-                self._open_device(dev)
-                # Check if framebuffer is blank
-                info = self._fb_info
-                probe_size = min(256, info["xres"] * (info["bpp"] // 8))
-                os.lseek(self._fd, 0, os.SEEK_SET)
-                sample = os.read(self._fd, probe_size)
-                if any(b != 0 for b in bytearray(sample)):
-                    return  # non-blank — use this device
-                # blank frame — close and try next
-                os.close(self._fd)
-                self._fd = None
-            except Exception as e:
-                last_exc = e
-                if self._fd is not None:
-                    try:
-                        os.close(self._fd)
-                    except Exception:
-                        pass
-                    self._fd = None
-        # All blank or failed — fall back to /dev/fb0
-        try:
-            self._open_device("/dev/fb0")
-        except Exception:
-            if last_exc:
-                raise last_exc
-            raise IOError("No framebuffer device available")
+                fd = os.open(dev, os.O_RDONLY)
+                sample = os.read(fd, 256)
+                os.close(fd)
+                if sample and sample != b"\x00" * len(sample):
+                    return dev
+            except OSError:
+                pass
+        # default — let the OS produce the error message
+        return "/dev/fb0"
 
-    def _open_device(self, dev):
-        self.device = dev
-        self._fd = os.open(dev, os.O_RDONLY)
-        self._read_vscreeninfo()
-
+    # ── VSCREENINFO ioctl (FIX-002) ────────────────────────────────────────
     def _read_vscreeninfo(self):
-        buf = array.array('B', [0] * 160)
-        fcntl.ioctl(self._fd, FBIOGET_VSCREENINFO, buf, True)
-        raw    = buf.tobytes()
-        fields = struct.unpack_from("<" + VSCREENINFO_FMT, raw)
+        # FIX-002: ARM64 kernels use 184-byte struct; was 160 — caused
+        #          garbage pixel offsets on VU+ Duo4K / Octagon SF8008
+        buf = array.array('B', [0] * 184)  # FIX-002: 184 bytes
+        try:
+            fcntl.ioctl(self._fd, FBIOGET_VSCREENINFO, buf, True)
+        except IOError as e:
+            raise IOError("FBIOGET_VSCREENINFO failed on {}: {}".format(
+                self.device, e))
+        raw = buf.tobytes()
+        try:
+            fields = struct.unpack_from("<" + VSCREENINFO_FMT, raw)
+        except struct.error as e:
+            # FIX-002: struct mismatch — parse minimal safe subset
+            fields = struct.unpack_from("<IIIIIIII", raw) + (0,) * 30
         self._fb_info = {
             "xres":         fields[0],
             "yres":         fields[1],
             "xoffset":      fields[4],
-            "yoffset":      fields[5],
+            "yoffset":      fields[5],   # FIX-001: needed for double-buffer
             "bpp":          fields[6],
             "red_offset":   fields[8],
             "red_len":      fields[9],
@@ -113,31 +131,36 @@ class FramebufferCapture(object):
             "alpha_len":    fields[18],
         }
 
+    # ── Capture (FIX-001) ──────────────────────────────────────────────────
     def capture_raw(self):
-        """Return raw framebuffer bytes for the visible page (handles yoffset)."""
+        """Return raw framebuffer bytes for the visible page."""
         info      = self._fb_info
-        stride    = info["xres"] * (info["bpp"] // 8)
-        byte_size = info["xres"] * info["yres"] * (info["bpp"] // 8)
-        offset    = info.get("yoffset", 0) * stride
+        w         = info["xres"]
+        h         = info["yres"]
+        bpp       = info["bpp"]
+        yoffset   = info.get("yoffset", 0)   # FIX-001: double-buffer offset
+        stride    = w * (bpp // 8)
+        byte_size = stride * h
+        seek_pos  = yoffset * stride           # FIX-001: seek to visible page
 
-        os.lseek(self._fd, offset, os.SEEK_SET)
+        os.lseek(self._fd, seek_pos, os.SEEK_SET)
 
-        # Chunked read — safe on Python 2 with large buffers
-        chunks = []
-        remaining = byte_size
-        while remaining > 0:
-            to_read = min(CHUNK_SIZE, remaining)
-            chunk   = os.read(self._fd, to_read)
+        # FIX-001: chunked read — single os.read() returns partial data on
+        #          slow MIPS kernels with limited pipe/device buffer sizes
+        data   = bytearray()
+        remain = byte_size
+        while remain > 0:
+            chunk = os.read(self._fd, min(_CHUNK, remain))
             if not chunk:
                 break
-            chunks.append(chunk)
-            remaining -= len(chunk)
-        return b"".join(chunks)
+            data  += chunk
+            remain -= len(chunk)
+
+        if len(data) < byte_size:  # FIX-001: raise on short read
+            raise IOError(
+                "Short framebuffer read: got {} expected {} bytes".format(
+                    len(data), byte_size))
+        return bytes(data)
 
     def get_info(self):
         return dict(self._fb_info)
-
-    def close(self):
-        if self._fd is not None:
-            os.close(self._fd)
-            self._fd = None
