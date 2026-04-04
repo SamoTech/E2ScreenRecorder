@@ -1,0 +1,12 @@
+Package: enigma2-plugin-extensions-e2screenrecorder
+Version: 1.0.0
+Architecture: all
+Section: extra
+Priority: optional
+Maintainer: SamoTech <info@samotech.dev>
+Description: E2ScreenRecorder - Screenshot & Video Capture for all Enigma2 STBs
+ Captures /dev/fb0 on all STB SoC families (BCM, HiSilicon, Amlogic, STi).
+ PNG/JPEG/BMP screenshots, MP4/AVI video, built-in WebIF.
+ Python 2.7-3.12+ compatible. Zero mandatory dependencies.
+Depends: enigma2
+Recommends: python3-pillow | python-imaging, ffmpeg

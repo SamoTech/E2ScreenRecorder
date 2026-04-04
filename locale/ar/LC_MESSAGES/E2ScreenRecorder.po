@@ -1,0 +1,34 @@
+# Arabic translation for E2ScreenRecorder
+# Ossama Hashim / SamoTech
+msgid ""
+msgstr ""
+"Project-Id-Version: E2ScreenRecorder 1.0.0\n"
+"Content-Type: text/plain; charset=UTF-8\n"
+"Language: ar\n"
+
+msgid "Screen Recorder"
+msgstr "\u0645\u0633\u062c\u02d9\u0651 \u0627\u0644\u0634\u0627\u0634\u0629"
+
+msgid "Take Screenshot (PNG)"
+msgstr "\u0627\u0644\u062a\u0642\u0627\u0637 \u0644\u0642\u0637\u0629 \u0634\u0627\u0634\u0629 (PNG)"
+
+msgid "Take Screenshot (JPEG)"
+msgstr "\u0627\u0644\u062a\u0642\u0627\u0637 \u0644\u0642\u0637\u0629 \u0634\u0627\u0634\u0629 (JPEG)"
+
+msgid "Start Screen Recording"
+msgstr "\u0628\u062f\u0621 \u062a\u0633\u062c\u064a\u0644 \u0627\u0644\u0634\u0627\u0634\u0629"
+
+msgid "Stop Recording"
+msgstr "\u0625\u064a\u0642\u0627\u0641 \u0627\u0644\u062a\u0633\u062c\u064a\u0644"
+
+msgid "Settings"
+msgstr "\u0627\u0644\u0625\u0639\u062f\u0627\u062f\u0627\u062a"
+
+msgid "Screenshot saved to:"
+msgstr "\u062a\u0645 \u062d\u0641\u0638 \u0644\u0642\u0637\u0629 \u0627\u0644\u0634\u0627\u0634\u0629 \u0641\u064a:"
+
+msgid "Recording started..."
+msgstr "\u0628\u062f\u0623 \u0627\u0644\u062a\u0633\u062c\u064a\u0644..."
+
+msgid "Recording stopped and saved."
+msgstr "\u062a\u0648\u0642\u02d9\u0651\u0641 \u0627\u0644\u062a\u0633\u062c\u064a\u0644 \u0648\u062a\u0645 \u0627\u0644\u062d\u0641\u0638."
