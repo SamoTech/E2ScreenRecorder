@@ -4,10 +4,14 @@ Normalise ANY framebuffer pixel format to standard RGB24 bytes.
 Handles: ARGB8888, RGBA8888, RGB565, BGR888, CLUT8, YUV420.
 Pure Python fallback; uses Numpy for speed when available.
 
-Black-screenshot fix (BCM7xxx / Amlogic):
-  Some STBs store pixels as ARGB8888 with alpha=0 for all pixels.
-  When the ioctl-reported channel offsets produce an all-black result,
-  _convert_32bpp() retries with the known-good BGRA->RGB layout.
+Resolution / colour fixes:
+  1. Channel scaling: each channel is normalised from its actual bit-depth
+     (red_len bits) to 8-bit using integer math, not raw truncation.
+     This fixes washed-out / wrong-colour output on RGBA4444, ARGB1555,
+     and other non-standard depths reported by some Amlogic/HiSilicon kernels.
+  2. Blank-frame fallback: if ioctl-reported offsets produce all-black output
+     (BCM7xxx alpha=0 issue), automatically retries with known-good layouts.
+  3. Fast path for the common 8-bit-per-channel 32bpp case (no scaling needed).
 """
 from __future__ import absolute_import, print_function, division
 import struct
@@ -38,6 +42,22 @@ def _looks_blank(rgb_bytes):
     return nonzero < 10
 
 
+def _scale_channel(value, bits):
+    """
+    Scale a channel value from `bits` bit depth to 8-bit (0-255).
+    Uses integer math only — no floating point, safe on all targets.
+    """
+    if bits == 0:
+        return 0
+    if bits == 8:
+        return value & 0xFF
+    maxval = (1 << bits) - 1
+    if maxval == 0:
+        return 0
+    # Integer rescale: (value * 255) // maxval
+    return (int(value & maxval) * 255) // maxval
+
+
 class PixelConverter(object):
 
     @staticmethod
@@ -66,26 +86,44 @@ class PixelConverter(object):
 
         result = PixelConverter._do_convert_32(raw, w, h, ro, go, bo, rl, gl, bl)
 
-        # FIX — BCM7xxx alpha=0: if ioctl offsets gave a blank frame,
-        # retry with each known-good fallback layout
+        # Blank-frame fallback (BCM7xxx alpha=0 or wrong ioctl offsets)
         if _looks_blank(result):
-            for (fr, fg, fb) in _FALLBACK_LAYOUTS_32:
+            for (fr, fg, fb_) in _FALLBACK_LAYOUTS_32:
                 candidate = PixelConverter._do_convert_32(
-                    raw, w, h, fr, fg, fb, 8, 8, 8)
+                    raw, w, h, fr, fg, fb_, 8, 8, 8)
                 if not _looks_blank(candidate):
                     return candidate
-            # All fallbacks also blank — return best-effort original
         return result
 
     @staticmethod
     def _do_convert_32(raw, w, h, ro, go, bo, rl, gl, bl):
-        """Core 32-bpp converter used by both primary and fallback paths."""
+        """
+        Core 32-bpp converter.
+        Handles standard 8-bit channels via fast path, and non-standard
+        depths (4, 5, 6 bit channels) via _scale_channel().
+        """
+        all_8bit = (rl == 8 and gl == 8 and bl == 8)
+
         if HAS_NUMPY:
             arr = np.frombuffer(raw, dtype=np.uint32).reshape((h, w))
-            r   = ((arr >> ro) & ((1 << rl) - 1)).astype(np.uint8)
-            g   = ((arr >> go) & ((1 << gl) - 1)).astype(np.uint8)
-            b   = ((arr >> bo) & ((1 << bl) - 1)).astype(np.uint8)
+            if all_8bit:
+                # Fast path: no scaling needed
+                r = ((arr >> ro) & 0xFF).astype(np.uint8)
+                g = ((arr >> go) & 0xFF).astype(np.uint8)
+                b = ((arr >> bo) & 0xFF).astype(np.uint8)
+            else:
+                # Normalise each channel from its actual bit depth to 8-bit
+                rm = int((1 << rl) - 1)
+                gm = int((1 << gl) - 1)
+                bm = int((1 << bl) - 1)
+                rv = ((arr >> ro) & rm).astype(np.uint32)
+                gv = ((arr >> go) & gm).astype(np.uint32)
+                bv = ((arr >> bo) & bm).astype(np.uint32)
+                r = (rv * 255 // (rm if rm else 1)).astype(np.uint8)
+                g = (gv * 255 // (gm if gm else 1)).astype(np.uint8)
+                b = (bv * 255 // (bm if bm else 1)).astype(np.uint8)
             return np.stack([r, g, b], axis=2).tobytes()
+
         else:
             rm = (1 << rl) - 1
             gm = (1 << gl) - 1
@@ -93,11 +131,19 @@ class PixelConverter(object):
             pixels = struct.unpack_from("<{}I".format(w * h), raw)
             out    = bytearray(w * h * 3)
             idx    = 0
-            for px in pixels:
-                out[idx]   = (px >> ro) & rm
-                out[idx+1] = (px >> go) & gm
-                out[idx+2] = (px >> bo) & bm
-                idx += 3
+            if all_8bit:
+                # Fast path
+                for px in pixels:
+                    out[idx]   = (px >> ro) & 0xFF
+                    out[idx+1] = (px >> go) & 0xFF
+                    out[idx+2] = (px >> bo) & 0xFF
+                    idx += 3
+            else:
+                for px in pixels:
+                    out[idx]   = _scale_channel((px >> ro), rl)
+                    out[idx+1] = _scale_channel((px >> go), gl)
+                    out[idx+2] = _scale_channel((px >> bo), bl)
+                    idx += 3
             return bytes(out)
 
     # ── 16-bpp RGB565 ────────────────────────────────────────────────────────

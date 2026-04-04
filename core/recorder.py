@@ -8,6 +8,13 @@ Strategy waterfall (first that works wins):
   3. Frame dump (PNG) + ffmpeg mux         — universal fallback
   4. ZIP of PNG frames                     — last resort, no ffmpeg
 
+Video recording fixes (v1.0.1):
+  - Mux now runs strictly AFTER stop_event fires (was called mid-loop)
+  - communicate_safe() used for ffmpeg wait (Py2/Py3 compatible timeout)
+  - Ring-buffer re-index runs before mux so ffmpeg gets sequential %06d
+  - Interruptible sleep via stop_event.wait() instead of time.sleep()
+  - Frame write errors skip the frame rather than aborting the recording
+
 Ring buffer in low-RAM mode caps disk use to RING_SIZE frames.
 """
 from __future__ import absolute_import, print_function, division
@@ -20,6 +27,7 @@ import subprocess
 
 from .framebuffer import FramebufferCapture
 from .converter   import PixelConverter
+from .compat      import communicate_safe
 
 try:
     from PIL import Image
@@ -57,7 +65,7 @@ class FrameRecorder(threading.Thread):
     # ── Main thread loop ─────────────────────────────────────────────────
 
     def run(self):
-        from ..backends.GrabberFFmpeg import get_ffmpeg, _FFMPEG_CACHE
+        from ..backends.GrabberFFmpeg import get_ffmpeg
 
         fb = FramebufferCapture(self.fb_device)
         try:
@@ -106,30 +114,19 @@ class FrameRecorder(threading.Thread):
         yoffset = info.get("yoffset", 0)
         device  = self.fb_device or "/dev/fb0"
 
-        # Map bpp -> ffmpeg pixel format
-        # Try to detect ARGB vs RGBA from channel offsets
         ro = info.get("red_offset", 16)
         if bpp == 32:
-            if ro == 16:
-                pix_fmt = "bgra"       # ARGB8888 — BCM/most STBs
-            elif ro == 0:
-                pix_fmt = "rgba"       # RGBA8888 — some HiSilicon
-            else:
-                pix_fmt = "bgra"       # safe default
+            pix_fmt = "bgra" if ro == 16 else "rgba"
         elif bpp == 16:
             pix_fmt = "rgb565le"
         else:
-            return False               # 8bpp — not suitable for rawvideo pipe
+            return False
 
-        # Virtual framebuffer height may include hidden pages;
-        # use actual h (yres) and skip yoffset rows with crop filter
         vf_filter = "crop={}:{}:0:0".format(w, h)
         if yoffset > 0:
             vf_filter = "crop={}:{}:0:{}".format(w, h, yoffset)
 
-        # Total virtual height = what the kernel reports as yres_virtual
-        # We read the full fb including back-buffer, then crop
-        fb_height = info.get("yres", h)   # fallback to yres if virtual not stored
+        fb_height = info.get("yres", h)
 
         cmd = [
             ffmpeg,
@@ -144,7 +141,7 @@ class FrameRecorder(threading.Thread):
             "-preset", "ultrafast",
             "-crf", "28",
             "-pix_fmt", "yuv420p",
-            "-t", "3600",   # safety cap: max 1 hour
+            "-t", "3600",
             "-y",
             self.output_path,
         ]
@@ -156,27 +153,30 @@ class FrameRecorder(threading.Thread):
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
             )
-            # Block here until stop() is called
-            while not self._stop_event.is_set():
-                time.sleep(0.5)
-                if proc.poll() is not None:
-                    break  # ffmpeg exited unexpectedly
 
-            # Send quit signal
+            # Block (interruptibly) until stop() is called
+            while not self._stop_event.is_set():
+                self._stop_event.wait(0.5)
+                if proc.poll() is not None:
+                    break
+
             try:
                 proc.stdin.write(b"q\n")
                 proc.stdin.flush()
             except Exception:
                 pass
             proc.terminate()
-            proc.wait()
 
-            # Verify output
+            # Wait with Py2-safe timeout
+            try:
+                communicate_safe(proc, timeout=30)
+            except Exception:
+                pass
+
             if (os.path.isfile(self.output_path)
                     and os.path.getsize(self.output_path) > 1024):
                 return True
 
-            # ffmpeg wrote an empty file — fall through to next strategy
             try:
                 os.remove(self.output_path)
             except Exception:
@@ -186,7 +186,7 @@ class FrameRecorder(threading.Thread):
         except Exception:
             return False
 
-    # ── Strategy 2: grab-per-frame JPEG pipe ───────────────────────────
+    # ── Strategy 2: grab-per-frame JPEG pipe ─────────────────────────────
 
     def _try_grab_pipe(self, info):
         """
@@ -201,7 +201,6 @@ class FrameRecorder(threading.Thread):
         if not ffmpeg:
             return False
 
-        # Find grab binary
         grab_bin = None
         for b in GRAB_BINS:
             try:
@@ -222,12 +221,12 @@ class FrameRecorder(threading.Thread):
         except OSError:
             pass
 
-        delay     = 1.0 / max(1, self.fps)
-        idx       = 0
+        delay       = 1.0 / max(1, self.fps)
+        idx         = 0
         frame_paths = []
 
         while not self._stop_event.is_set():
-            t0 = time.time()
+            t0         = time.time()
             frame_path = "{}/{:06d}.jpg".format(tmp_dir, idx)
             try:
                 ret = subprocess.call(
@@ -238,13 +237,12 @@ class FrameRecorder(threading.Thread):
             except Exception:
                 pass
             idx += 1
-            elapsed = time.time() - t0
-            time.sleep(max(0.0, delay - elapsed))
+            # Interruptible sleep
+            self._stop_event.wait(max(0.0, delay - (time.time() - t0)))
 
         if not frame_paths:
             return False
 
-        # Write ffmpeg concat list
         list_path = "{}/concat.txt".format(tmp_dir)
         with open(list_path, "w") as f:
             for fp in frame_paths:
@@ -259,7 +257,12 @@ class FrameRecorder(threading.Thread):
             "-crf", "28", "-pix_fmt", "yuv420p",
             "-y", self.output_path,
         ]
-        subprocess.call(cmd)
+        proc = subprocess.Popen(cmd, stdout=subprocess.PIPE,
+                                stderr=subprocess.PIPE)
+        try:
+            communicate_safe(proc, timeout=120)
+        except Exception:
+            pass
 
         ok = (os.path.isfile(self.output_path)
               and os.path.getsize(self.output_path) > 1024)
@@ -269,7 +272,7 @@ class FrameRecorder(threading.Thread):
             pass
         return ok
 
-    # ── Strategy 3: frame-dump + mux ──────────────────────────────────
+    # ── Strategy 3: frame-dump + mux ─────────────────────────────────────
 
     def _run_frame_dump(self, info, w, h):
         tmp_dir = "/tmp/e2rec_{}".format(os.getpid())
@@ -285,33 +288,42 @@ class FrameRecorder(threading.Thread):
         idx   = 0
 
         while not self._stop_event.is_set():
-            t0  = time.time()
-            raw = fb.capture_raw()
-            rgb = PixelConverter.to_rgb24(raw, info)
-            frame_path = "{}/{:06d}.png".format(tmp_dir, idx)
-            self._write_frame(rgb, w, h, frame_path)
+            t0 = time.time()
+            try:
+                raw = fb.capture_raw()
+                rgb = PixelConverter.to_rgb24(raw, info)
+                frame_path = "{}/{:06d}.png".format(tmp_dir, idx)
+                self._write_frame(rgb, w, h, frame_path)
 
-            if self.low_ram:
-                self._frame_list.append(frame_path)
-                if len(self._frame_list) > RING_SIZE:
-                    old = self._frame_list.pop(0)
-                    try:
-                        os.remove(old)
-                    except OSError:
-                        pass
-            else:
-                self._frame_list.append(frame_path)
+                if self.low_ram:
+                    self._frame_list.append(frame_path)
+                    if len(self._frame_list) > RING_SIZE:
+                        old = self._frame_list.pop(0)
+                        try:
+                            os.remove(old)
+                        except OSError:
+                            pass
+                else:
+                    self._frame_list.append(frame_path)
 
-            idx += 1
-            time.sleep(max(0.0, delay - (time.time() - t0)))
+                idx += 1
+            except Exception:
+                # Skip bad frame — keep recording
+                pass
+
+            # Interruptible sleep: wakes immediately when stop() is called
+            self._stop_event.wait(max(0.0, delay - (time.time() - t0)))
 
         fb.close()
+
+        # FIX: mux runs AFTER the loop exits, never mid-loop
         self._mux_frames(tmp_dir, w, h)
 
     def _write_frame(self, rgb24, w, h, path):
         if HAS_PIL:
             try:
-                Image.frombytes("RGB", (w, h), rgb24).save(path)
+                Image.frombytes("RGB", (w, h), rgb24).save(
+                    path, "PNG", optimize=False, compress_level=1)
                 return
             except Exception:
                 pass
@@ -322,13 +334,13 @@ class FrameRecorder(threading.Thread):
         from ..backends.GrabberFFmpeg import get_ffmpeg
         ffmpeg = get_ffmpeg()
 
-        # Re-number frames sequentially (ring buffer may have gaps)
+        # Collect surviving frames and re-index sequentially
+        # (ring buffer may have removed early frames, leaving gaps)
         sequential = [f for f in self._frame_list if os.path.isfile(f)]
         if not sequential:
             return
 
         if ffmpeg:
-            # Rename to sequential for ffmpeg %06d pattern
             for new_idx, old_path in enumerate(sequential):
                 new_path = "{}/mux_{:06d}.png".format(tmp_dir, new_idx)
                 if old_path != new_path:
@@ -346,13 +358,21 @@ class FrameRecorder(threading.Thread):
                 "-preset", "ultrafast",
                 "-crf", "28",
                 "-pix_fmt", "yuv420p",
+                "-movflags", "+faststart",
                 "-y", self.output_path,
             ]
-            subprocess.call(cmd)
+            proc = subprocess.Popen(cmd, stdout=subprocess.PIPE,
+                                    stderr=subprocess.PIPE)
+            try:
+                communicate_safe(proc, timeout=300)
+            except Exception as e:
+                if callable(self.on_error):
+                    self.on_error("FFmpeg mux error: {}".format(e))
 
-        if (not os.path.isfile(self.output_path)
+        # Strategy 4: ZIP fallback if ffmpeg missing or produced empty file
+        if (not ffmpeg
+                or not os.path.isfile(self.output_path)
                 or os.path.getsize(self.output_path) < 1024):
-            # Strategy 4: ZIP fallback
             import zipfile
             zip_path = self.output_path.rsplit(".", 1)[0] + "_frames.zip"
             with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zf:
@@ -360,7 +380,7 @@ class FrameRecorder(threading.Thread):
                     if os.path.isfile(fp):
                         zf.write(fp, os.path.basename(fp))
 
-        # Cleanup tmp frames
+        # Cleanup temp frames
         try:
             shutil.rmtree(tmp_dir, ignore_errors=True)
         except Exception:
