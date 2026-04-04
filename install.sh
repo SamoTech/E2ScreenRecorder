@@ -1,7 +1,7 @@
 #!/bin/sh
 # =============================================================================
 # E2ScreenRecorder — Production Install Script
-# Version : 2.1.0
+# Version : 2.2.0
 # Target  : All Enigma2 STB images (BusyBox/toybox shell, MIPS/ARM/AArch64)
 # Features: install / uninstall / update  |  env detection  |  full dep check
 # Usage   : sh install.sh [install|uninstall|update]
@@ -53,35 +53,141 @@ acquire_lock() {
 }
 release_lock() { rm -f "$LOCK_FILE"; }
 
-# ── Environment detection ─────────────────────────────────────────────────────
+# =============================================================================
+# ── IMAGE DETECTION  (v2.2 — multi-source, priority-ordered)
+# =============================================================================
+# Detection runs through six sources in priority order, stopping as soon as a
+# definitive match is found.  All comparisons are case-insensitive via tr/grep.
+#
+# PRIORITY ORDER
+#  1. /etc/image-version   — key=value file written by the build system;
+#                            most reliable because it is machine-generated.
+#                            Keys: distro=, imagename=, version=
+#  2. /etc/os-release      — systemd-style; present on newer OE2.5/OE2.6 images
+#                            Keys: NAME=, ID=, VERSION_ID=
+#  3. /etc/issue           — human-readable; older images, sometimes the only
+#                            source.  Highly variable format — use grep -i.
+#  4. /etc/opkg/distfeeds.conf — feed names contain image family strings;
+#                            useful fallback when all text files are vague.
+#  5. opkg info enigma2    — package description always mentions the image;
+#                            slow (reads package database) so used last.
+#  6. Hardcoded "Unknown"  — graceful fallback; plugin still works.
+#
+# VERSION PARSING
+#  Try /etc/image-version version= first, then /etc/os-release VERSION_ID=,
+#  then grep for X.Y.Z or X.Y anywhere in /etc/issue.
+#  Exported as IMAGE_VERSION (may be empty on very old images).
+# =============================================================================
+
+# Internal: match a string (already lowercased) against known image names.
+# Sets IMAGE_NAME and returns 0 on match, 1 on no match.
+_match_image() {
+    _lc="$1"
+    case "$_lc" in
+        *openatv*)                IMAGE_NAME="OpenATV";       return 0 ;;
+        *openpli*|*open_pli*)     IMAGE_NAME="OpenPLi";       return 0 ;;
+        *opendreambox*|*dreamos*) IMAGE_NAME="DreamOS";       return 0 ;;
+        *dreambox*)               IMAGE_NAME="DreamOS";       return 0 ;;
+        *vti*)                    IMAGE_NAME="VTi";           return 0 ;;
+        *openbh*|*blackhole*|*black_hole*) IMAGE_NAME="OpenBH"; return 0 ;;
+        *openspa*)                IMAGE_NAME="OpenSPA";       return 0 ;;
+        *openhdf*)                IMAGE_NAME="OpenHDF";       return 0 ;;
+        *pure2*)                  IMAGE_NAME="Pure2";         return 0 ;;
+        *egami*)                  IMAGE_NAME="EGAMI";         return 0 ;;
+        *beyonwiz*)               IMAGE_NAME="Beyonwiz";      return 0 ;;
+        *teamblue*)               IMAGE_NAME="teamBlue";      return 0 ;;
+        *openmips*)               IMAGE_NAME="OpenMIPS";      return 0 ;;
+        *merlin*)                 IMAGE_NAME="Merlin";        return 0 ;;
+        *openvix*)                IMAGE_NAME="OpenVIX";       return 0 ;;
+        *ihad*)                   IMAGE_NAME="IHAD";          return 0 ;;
+        *newnigma*)               IMAGE_NAME="Newnigma2";     return 0 ;;
+        *openrsi*)                IMAGE_NAME="OpenRSI";       return 0 ;;
+        *dgs*)                    IMAGE_NAME="DGS";           return 0 ;;
+        *sifteam*)                IMAGE_NAME="SifTeam";       return 0 ;;
+        *oozo*)                   IMAGE_NAME="OoZooN";        return 0 ;;
+        *ncam*)                   IMAGE_NAME="NCam";          return 0 ;;
+        *feed*)                   IMAGE_NAME="FEED";          return 0 ;;
+    esac
+    return 1
+}
+
+# Internal: extract version string from arbitrary text.
+# Accepts X.Y.Z, X.Y, or just X (major) — returns first match.
+_parse_version() {
+    echo "$1" | grep -oE '[0-9]+\.[0-9]+(\.[0-9]+)?' | head -n1
+}
+
 detect_image() {
     IMAGE_NAME="Unknown"
-    for f in /etc/issue /etc/os-release /etc/opkg/arch.conf \
-              /etc/enigma2-version /etc/distro-version; do
-        [ -f "$f" ] || continue
-        content=$(cat "$f" 2>/dev/null || echo "")
-        case "$content" in
-            *OpenATV*)              IMAGE_NAME="OpenATV";       break ;;
-            *OpenPLi*|*openpli*|*OpenPLI*) IMAGE_NAME="OpenPLi"; break ;;
-            *DreamOS*|*[Dd]reambox*) IMAGE_NAME="DreamOS";      break ;;
-            *VTi*)                  IMAGE_NAME="VTi";           break ;;
-            *OpenDreambox*)         IMAGE_NAME="OpenDreambox";  break ;;
-            *OpenBH*|*BlackHole*)   IMAGE_NAME="OpenBH";        break ;;
-            *OpenSPA*)              IMAGE_NAME="OpenSPA";       break ;;
-            *[Oo]pen[Hh][Dd][Ff]*) IMAGE_NAME="OpenHDF";        break ;;
-            *Pure2*)                IMAGE_NAME="Pure2";         break ;;
-            *EGAMI*)                IMAGE_NAME="EGAMI";         break ;;
-            *Beyonwiz*)             IMAGE_NAME="Beyonwiz";      break ;;
-            *teamBlue*)             IMAGE_NAME="teamBlue";      break ;;
-            *OpenMIPS*)             IMAGE_NAME="OpenMIPS";      break ;;
-            *Merlin*)               IMAGE_NAME="Merlin";        break ;;
-            *OpenVIX*)              IMAGE_NAME="OpenVIX";       break ;;
-            *IHAD*)                 IMAGE_NAME="IHAD";          break ;;
-            *Newnigma*)             IMAGE_NAME="Newnigma2";     break ;;
-        esac
-    done
+    IMAGE_VERSION=""
+
+    # ── SOURCE 1: /etc/image-version (build-system generated, most reliable) ──
+    if [ -f /etc/image-version ]; then
+        # Extract distro= or imagename= key
+        _dist=$(grep -i '^distro=' /etc/image-version 2>/dev/null | cut -d'=' -f2- | tr '[:upper:]' '[:lower:]' | tr -d '"\r ')
+        [ -z "$_dist" ] && _dist=$(grep -i '^imagename=' /etc/image-version 2>/dev/null | cut -d'=' -f2- | tr '[:upper:]' '[:lower:]' | tr -d '"\r ')
+
+        if [ -n "$_dist" ] && _match_image "$_dist"; then
+            # version= key in same file
+            IMAGE_VERSION=$(grep -i '^version=' /etc/image-version 2>/dev/null | cut -d'=' -f2- | tr -d '"\r ')
+            log_info "[image-version] distro=$_dist → $IMAGE_NAME  ver=$IMAGE_VERSION"
+        fi
+    fi
+
+    # ── SOURCE 2: /etc/os-release (OE2.5 / OE2.6 images) ────────────────────
+    if [ "$IMAGE_NAME" = "Unknown" ] && [ -f /etc/os-release ]; then
+        _name=$(grep -i '^NAME=' /etc/os-release 2>/dev/null | cut -d'=' -f2- | tr '[:upper:]' '[:lower:]' | tr -d '"\r ')
+        [ -z "$_name" ] && _name=$(grep -i '^ID=' /etc/os-release 2>/dev/null | cut -d'=' -f2- | tr '[:upper:]' '[:lower:]' | tr -d '"\r ')
+
+        if [ -n "$_name" ] && _match_image "$_name"; then
+            IMAGE_VERSION=$(grep -i '^VERSION_ID=' /etc/os-release 2>/dev/null | cut -d'=' -f2- | tr -d '"\r ')
+            [ -z "$IMAGE_VERSION" ] && IMAGE_VERSION=$(grep -i '^VERSION=' /etc/os-release 2>/dev/null | cut -d'=' -f2- | tr -d '"\r ')
+            IMAGE_VERSION=$(_parse_version "$IMAGE_VERSION")
+            log_info "[os-release] NAME=$_name → $IMAGE_NAME  ver=$IMAGE_VERSION"
+        fi
+    fi
+
+    # ── SOURCE 3: /etc/issue (legacy images, most variable format) ───────────
+    if [ "$IMAGE_NAME" = "Unknown" ] && [ -f /etc/issue ]; then
+        _issue=$(cat /etc/issue 2>/dev/null | tr '[:upper:]' '[:lower:]')
+        if _match_image "$_issue"; then
+            [ -z "$IMAGE_VERSION" ] && IMAGE_VERSION=$(_parse_version "$_issue")
+            log_info "[/etc/issue] → $IMAGE_NAME  ver=$IMAGE_VERSION"
+        fi
+    fi
+
+    # ── SOURCE 4: /etc/opkg/distfeeds.conf (feed names carry image family) ───
+    if [ "$IMAGE_NAME" = "Unknown" ] && [ -f /etc/opkg/distfeeds.conf ]; then
+        _feeds=$(cat /etc/opkg/distfeeds.conf 2>/dev/null | tr '[:upper:]' '[:lower:]')
+        if _match_image "$_feeds"; then
+            log_info "[distfeeds.conf] → $IMAGE_NAME"
+        fi
+    fi
+
+    # ── SOURCE 5: opkg info enigma2 (slow — last resort text scan) ───────────
+    if [ "$IMAGE_NAME" = "Unknown" ] && command -v opkg >/dev/null 2>&1; then
+        _opkg_desc=$(opkg info enigma2 2>/dev/null | tr '[:upper:]' '[:lower:]')
+        if [ -n "$_opkg_desc" ] && _match_image "$_opkg_desc"; then
+            log_info "[opkg info enigma2] → $IMAGE_NAME"
+        fi
+    fi
+
+    # ── VERSION fallback: scan /etc/issue for X.Y.Z or X.Y if still empty ───
+    if [ -z "$IMAGE_VERSION" ] && [ -f /etc/issue ]; then
+        IMAGE_VERSION=$(_parse_version "$(cat /etc/issue 2>/dev/null)")
+    fi
+    # Final fallback: try /etc/enigma2-version or /etc/distro-version
+    if [ -z "$IMAGE_VERSION" ]; then
+        for _vf in /etc/enigma2-version /etc/distro-version; do
+            [ -f "$_vf" ] && IMAGE_VERSION=$(_parse_version "$(cat "$_vf" 2>/dev/null)") && break
+        done
+    fi
+
     log_info "Detected image  : $IMAGE_NAME"
+    log_info "Detected version: ${IMAGE_VERSION:-unknown}"
 }
+
+# ── END IMAGE DETECTION ───────────────────────────────────────────────────────
 
 detect_python() {
     PY_BIN=""; PY_VER=0
@@ -152,23 +258,11 @@ remove_plugin_files() {
 # =============================================================================
 # ── DEPENDENCY HANDLING ───────────────────────────────────────────────────────
 # =============================================================================
-# Full matrix of every package the plugin needs, organised by priority tier:
-#
-#   TIER 1 – REQUIRED  : plugin WILL NOT LOAD without these
-#   TIER 2 – IMPORTANT : reduced features / fallback mode without these
-#   TIER 3 – OPTIONAL  : speed / quality enhancements only
-#
-# Each package is checked with opkg list-installed first (fast, no network).
-# Missing packages are installed via opkg; failures are logged but non-fatal
-# for TIER 2/3 because the plugin has pure-Python fallbacks for everything.
-# =============================================================================
 
-# Helper: check if an opkg package is already installed.
 _opkg_installed() {
     opkg list-installed 2>/dev/null | grep -q "^${1} "
 }
 
-# Helper: try to install a package; returns 0 on success, 1 on failure.
 _opkg_install() {
     pkg="$1"
     if _opkg_installed "$pkg"; then
@@ -179,7 +273,6 @@ _opkg_install() {
     opkg install "$pkg" 2>&1 | tee -a "$LOG_FILE" && return 0 || return 1
 }
 
-# Helper: verify a Python module can actually be imported.
 _py_module_ok() {
     $PY_BIN -c "import $1" 2>/dev/null
 }
@@ -187,56 +280,37 @@ _py_module_ok() {
 install_deps() {
     log_section "Dependency Check  (image: $IMAGE_NAME  |  python: v$PY_VER)"
 
-    # ── opkg availability ───────────────────────────────────────────────────
     if ! command -v opkg >/dev/null 2>&1; then
         log_warn "opkg not found — cannot install packages. Continuing with what is present."
         _verify_minimum_runtime
         return
     fi
 
-    # ── opkg update ─────────────────────────────────────────────────────────
     log_info "Running opkg update ..."
     opkg update 2>&1 | tee -a "$LOG_FILE" \
         || log_warn "opkg update failed — package lists may be stale."
 
-    # ====================================================================
-    # TIER 1 — REQUIRED
-    # The plugin uses only Python stdlib for its core path, so the only
-    # hard requirement is a working Python interpreter + its standard
-    # library modules: os, sys, struct, mmap, ctypes, fcntl, array,
-    # threading, zlib, io, json, zipfile, socket, http.server / BaseHTTPServer
-    # All of these ship inside the python3-core or python-core package.
-    # ====================================================================
     log_info "--- TIER 1: Required packages ---"
 
     if [ "$PY_VER" -eq 3 ]; then
         _opkg_install "python3"           || log_warn "python3 meta-package missing"
         _opkg_install "python3-core"      || abort "python3-core is required and could not be installed."
-        # zlib / compression — used by our built-in PNG encoder (zlib.compress)
         _opkg_install "python3-compression" \
             || _opkg_install "python3-zlib" \
             || log_warn "python3 zlib package not found — PNG fallback may fail on some images."
-        # threading — FrameRecorder and WebIF server both run as daemon threads
         _opkg_install "python3-threading" \
             || log_warn "python3-threading not found — it is usually bundled inside python3-core."
-        # io / codecs — used by every file write path
-        _opkg_install "python3-io"        || true  # almost always in core
-        # json — used by WebIF API responses
+        _opkg_install "python3-io"        || true
         _opkg_install "python3-json"      \
             || log_warn "python3-json missing — WebIF status API will be unavailable."
-        # ctypes — used by framebuffer ioctl helpers on some STB kernels
         _opkg_install "python3-ctypes"    \
             || log_warn "python3-ctypes not found — ioctl fallback path will be used."
-        # logging module — used by utils/logger.py
         _opkg_install "python3-logging"   || true
-        # urllib / http.server — built-in WebIF depends on http.server (py3 stdlib)
         _opkg_install "python3-urllib"    || true
-        # shell utilities needed during install itself
         _opkg_install "wget"  || _opkg_install "curl"  \
             || log_warn "Neither wget nor curl installed — file downloads may fail."
         _opkg_install "unzip" || log_warn "unzip not installed — ZIP fallback will be unavailable."
     else
-        # Python 2.7 path
         _opkg_install "python"            || abort "python (2.7) is required and could not be installed."
         _opkg_install "python-core"       || abort "python-core is required and could not be installed."
         _opkg_install "python-compression" \
@@ -255,14 +329,9 @@ install_deps() {
         _opkg_install "unzip" || log_warn "unzip not installed."
     fi
 
-    # ====================================================================
-    # TIER 2 — IMPORTANT  (plugin runs in fallback/reduced mode without)
-    # ====================================================================
     log_info "--- TIER 2: Important packages (quality/feature fallbacks) ---"
 
     if [ "$PY_VER" -eq 3 ]; then
-        # Pillow — best screenshot quality (PNG, JPEG, BMP with metadata)
-        # Without it the plugin uses the built-in pure-Python PPM/PNG writer
         if ! _py_module_ok "PIL"; then
             _opkg_install "python3-pillow" \
                 || _opkg_install "python3-pil" \
@@ -271,12 +340,9 @@ install_deps() {
         else
             log_skip "PIL/Pillow  (Python module already importable)"
         fi
-
-        # struct / codecs extras — explicit large-buffer struct.unpack
         _opkg_install "python3-codecs"    || true
-        _opkg_install "python3-misc"      || true  # includes many small stdlib extras
-        _opkg_install "python3-mmap"      || true  # mmap.mmap used by framebuffer engine
-
+        _opkg_install "python3-misc"      || true
+        _opkg_install "python3-mmap"      || true
     else
         if ! _py_module_ok "PIL"; then
             _opkg_install "python-imaging" \
@@ -290,8 +356,6 @@ install_deps() {
         _opkg_install "python-mmap"       || true
     fi
 
-    # FFmpeg binary — preferred video encoder
-    # Without it FrameRecorder falls back to a ZIP archive of PNG frames
     if ! command -v ffmpeg >/dev/null 2>&1; then
         log_info "  Installing ffmpeg ..."
         _opkg_install "ffmpeg" \
@@ -301,39 +365,29 @@ install_deps() {
         log_skip "ffmpeg  ($(ffmpeg -version 2>&1 | head -1))"
     fi
 
-    # ====================================================================
-    # TIER 3 — OPTIONAL  (speed / quality enhancements only)
-    # ====================================================================
     log_info "--- TIER 3: Optional packages (speed / quality enhancements) ---"
 
     if [ "$PY_VER" -eq 3 ]; then
-        # NumPy — accelerates pixel-format conversion (ARGB→RGB24) significantly
-        # Without it the converter uses a pure-Python loop (slower but correct)
         if ! _py_module_ok "numpy"; then
             _opkg_install "python3-numpy" \
                 || log_warn "NumPy not available — pixel conversion uses pure-Python loop (correct, but slower on 1080p)."
         else
             log_skip "numpy  (already importable)"
         fi
-
-        # OpenCV — optional enhanced backend for screenshots
         if ! _py_module_ok "cv2"; then
             _opkg_install "python3-opencv" \
                 || _opkg_install "python3-cv2" \
-                || true   # fully optional — no warning needed
+                || true
         else
             log_skip "cv2/OpenCV  (already importable)"
         fi
-
-        # GStreamer Python bindings — native E2 video recording path
         if ! _py_module_ok "gi"; then
             _opkg_install "python3-gi" \
                 || _opkg_install "python3-pygobject" \
-                || true   # optional — FFmpeg path is preferred anyway
+                || true
         else
             log_skip "gi/GStreamer bindings  (already importable)"
         fi
-
     else
         if ! _py_module_ok "numpy"; then
             _opkg_install "python-numpy" || true
@@ -347,11 +401,9 @@ install_deps() {
         fi
     fi
 
-    # ── Post-install: verify minimum runtime is actually usable ─────────────
     _verify_minimum_runtime
 }
 
-# Final sanity check: confirm the absolute minimum modules are importable.
 _verify_minimum_runtime() {
     log_info "--- Runtime verification ---"
     failed_mods=""
@@ -365,7 +417,6 @@ _verify_minimum_runtime() {
         fi
     done
 
-    # mmap and ctypes: warn but not fatal (fallback paths exist)
     for mod in mmap ctypes fcntl; do
         if _py_module_ok "$mod"; then
             log_ok "  import $mod"
@@ -374,21 +425,18 @@ _verify_minimum_runtime() {
         fi
     done
 
-    # Pillow availability summary
     if _py_module_ok "PIL"; then
         log_ok "  import PIL (Pillow)  — full screenshot quality available"
     else
         log_warn "  import PIL  not available — using built-in PPM/PNG encoder"
     fi
 
-    # FFmpeg binary summary
     if command -v ffmpeg >/dev/null 2>&1; then
         log_ok "  ffmpeg binary found  — MP4/AVI video recording enabled"
     else
         log_warn "  ffmpeg not found     — video falls back to ZIP-of-frames"
     fi
 
-    # NumPy summary
     if _py_module_ok "numpy"; then
         log_ok "  import numpy  — accelerated pixel conversion enabled"
     else
@@ -553,7 +601,7 @@ cleanup_tmp() { rm -rf "$TMP_DIR" 2>/dev/null || true; }
 
 # ── INSTALL ───────────────────────────────────────────────────────────────────
 do_install() {
-    log_section "E2ScreenRecorder Installer v2.1.0"
+    log_section "E2ScreenRecorder Installer v2.2.0"
     acquire_lock
     trap 'release_lock; cleanup_tmp' EXIT
 
@@ -561,7 +609,7 @@ do_install() {
     detect_python
     detect_arch
     preinstall_check
-    install_deps          # ← full tier-1/2/3 dependency matrix
+    install_deps
     detect_framebuffer
     download_plugin
     set_permissions
@@ -571,7 +619,7 @@ do_install() {
 
     log_section "Installation Complete"
     log_info "Plugin installed at : $INSTALL_DIR"
-    log_info "Image               : $IMAGE_NAME"
+    log_info "Image               : $IMAGE_NAME  ${IMAGE_VERSION}"
     log_info "Python              : $PY_BIN (v$PY_VER)"
     log_info "Architecture        : $ARCH"
     log_info "Framebuffer         : $FB_DEVICE"
