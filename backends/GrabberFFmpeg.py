@@ -1,69 +1,69 @@
 # -*- coding: utf-8 -*-
 """
-FFmpeg subprocess backend for video recording and screenshot fallback.
+Video recording via FFmpeg subprocess.
+Uses -f fbdev (live framebuffer device demuxer) — NOT -f rawvideo.
 
-Key fixes:
-  - get_ffmpeg() caches result — avoids repeated subprocess calls on
-    every frame during recording
-  - FFmpegRecorder.stop() sends 'q\n' (with newline) for clean exit
-  - Direct /dev/fb rawvideo recording now in FrameRecorder Strategy 1
-  - Pixel format detection uses red_offset from ioctl, not hardcoded
+Why fbdev and not rawvideo?
+  -f rawvideo treats /dev/fb0 as a finite file: FFmpeg calculates
+  duration = filesize / bitrate, reads exactly one frame, then exits.
+  Result: empty or 1-second output file.
+  -f fbdev is a proper live-device demuxer that streams until killed.
+
+Stopping: send SIGTERM (proc.terminate()) — NOT stdin 'q'.
+  Writing 'q' to stdin is unreliable; some STB ffmpeg builds ignore it.
 """
 from __future__ import absolute_import, print_function, division
 
-import subprocess
 import os
+import subprocess
 
-FFMPEG_PATHS = [
+from ..utils.logger import log
+
+# Common FFmpeg install locations on Enigma2 STBs
+_FFMPEG_CANDIDATES = [
     "ffmpeg",
     "/usr/bin/ffmpeg",
     "/usr/local/bin/ffmpeg",
     "/opt/bin/ffmpeg",
-    "/opt/local/bin/ffmpeg",
-    "/usr/bin/avconv",     # libav fallback (Debian/Ubuntu older images)
-    "/usr/local/bin/avconv",
+    "/opt/usr/bin/ffmpeg",
 ]
-
-# Module-level cache so we only probe once per process lifetime
-_FFMPEG_CACHE = None
 
 
 def get_ffmpeg():
-    """Return path to ffmpeg/avconv binary, or None. Result is cached."""
-    global _FFMPEG_CACHE
-    if _FFMPEG_CACHE is not None:
-        return _FFMPEG_CACHE if _FFMPEG_CACHE != "" else None
-
-    for b in FFMPEG_PATHS:
+    """Return path to ffmpeg binary or None."""
+    for candidate in _FFMPEG_CANDIDATES:
         try:
-            ret = subprocess.call(
-                [b, "-version"],
+            if candidate != "ffmpeg" and not os.path.isfile(candidate):
+                continue
+            subprocess.check_call(
+                [candidate, "-version"],
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
             )
-            if ret == 0:
-                _FFMPEG_CACHE = b
-                return b
+            return candidate
         except Exception:
             continue
-
-    _FFMPEG_CACHE = ""   # cache negative result
     return None
 
 
 class FFmpegRecorder(object):
     """
-    Direct framebuffer -> ffmpeg rawvideo pipe recorder.
-    Used as a standalone object when FrameRecorder Strategy 1 is
-    invoked from outside the thread (e.g. tests or external tools).
+    Live framebuffer recorder using FFmpeg's fbdev input demuxer.
+
+    Usage:
+        rec = FFmpegRecorder(output_path, fps=5, fb_device="/dev/fb0")
+        rec.start()          # spawns ffmpeg subprocess
+        ...                  # recording runs in background
+        rec.stop()           # sends SIGTERM, waits for clean exit
     """
 
-    def __init__(self, fb_info, output_path, fps=5, codec="libx264", crf=28):
-        self.fb_info     = fb_info
+    def __init__(self, output_path, fps=5, codec="libx264", crf=28,
+                 fb_device="/dev/fb0"):
         self.output_path = output_path
         self.fps         = fps
         self.codec       = codec
         self.crf         = crf
+        self.fb_device   = fb_device
         self._proc       = None
         self._binary     = get_ffmpeg()
 
@@ -72,35 +72,27 @@ class FFmpegRecorder(object):
 
     def start(self):
         if not self._binary:
-            raise RuntimeError("FFmpeg not found on this device")
-        info    = self.fb_info
-        w, h    = info["xres"], info["yres"]
-        bpp     = info["bpp"]
-        ro      = info.get("red_offset", 16)
+            raise RuntimeError(
+                "FFmpeg not found. Install it: opkg install ffmpeg")
 
-        if bpp == 32:
-            pix_fmt = "bgra" if ro == 16 else "rgba"
-        elif bpp == 16:
-            pix_fmt = "rgb565le"
-        else:
-            raise RuntimeError("Unsupported bpp for rawvideo: {}".format(bpp))
-
+        # -f fbdev  → live framebuffer device demuxer (streams until killed)
+        # -framerate → capture FPS (low = less CPU; 5 is fine for screen recording)
+        # no -t / no -vframes → run indefinitely until proc.terminate()
         cmd = [
             self._binary,
-            "-loglevel", "error",
-            "-f", "rawvideo",
-            "-pixel_format", pix_fmt,
-            "-video_size", "{}x{}".format(w, h),
+            "-f", "fbdev",
             "-framerate", str(self.fps),
-            "-i", "/dev/fb0",
+            "-i", self.fb_device,
             "-c:v", self.codec,
             "-crf", str(self.crf),
             "-preset", "ultrafast",
-            "-pix_fmt", "yuv420p",
-            "-t", "3600",
+            "-pix_fmt", "yuv420p",   # broadest player compatibility
             "-y",
             self.output_path,
         ]
+
+        log.info("FFmpegRecorder.start: {}".format(" ".join(cmd)))
+
         self._proc = subprocess.Popen(
             cmd,
             stdin=subprocess.PIPE,
@@ -109,15 +101,19 @@ class FFmpegRecorder(object):
         )
 
     def stop(self):
-        if self._proc:
+        """Stop recording cleanly via SIGTERM and wait for ffmpeg to flush."""
+        if self._proc is None:
+            return
+        try:
+            self._proc.terminate()   # SIGTERM — ffmpeg flushes + writes MOOV
             try:
-                # Send 'q\n' — ffmpeg requires newline to flush stdin command
-                self._proc.stdin.write(b"q\n")
-                self._proc.stdin.flush()
+                self._proc.wait(timeout=10)
             except Exception:
-                pass
-            import time
-            time.sleep(0.5)   # give ffmpeg time to flush and close GOP
-            self._proc.terminate()
-            self._proc.wait()
+                self._proc.kill()    # fallback SIGKILL if it hangs
+        except Exception as e:
+            log.warning("FFmpegRecorder.stop error: {}".format(e))
+        finally:
             self._proc = None
+
+    def is_running(self):
+        return self._proc is not None and self._proc.poll() is None

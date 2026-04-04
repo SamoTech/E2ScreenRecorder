@@ -1,49 +1,28 @@
 # -*- coding: utf-8 -*-
 """
-Video recorder engine — daemon thread, multiple recording strategies.
+Video recorder engine.
 
-Strategy waterfall (first that works wins):
-  1. FFmpeg direct /dev/fb0 rawvideo pipe  — fastest, zero PIL dep
-  2. grab-per-frame JPEG pipe into ffmpeg  — STiH/Sigma video+OSD
-  3. Frame dump (PNG) + ffmpeg mux         — universal fallback
-  4. ZIP of PNG frames                     — last resort, no ffmpeg
+Strategy selection (in priority order):
+  1. FFmpeg fbdev live capture  — best quality, lowest RAM, preferred
+  2. Frame-by-frame PNG + mux   — fallback when ffmpeg missing
+  3. Frame-by-frame PNG + ZIP   — last resort (no muxer at all)
 
-Video recording fixes (v1.0.3):
-  - _try_ffmpeg_direct: probe ffmpeg with -version BEFORE spawning the
-    capture process — rejects broken PATH entries early
-  - _try_ffmpeg_direct: non-zero ffmpeg exit code now calls on_error
-    with the last line of stderr so the UI shows why video failed
-  - _try_ffmpeg_direct: explicit -t 3600 safety cap (was already there
-    but now also logged to /tmp/ffmpeg_e2rec.log at WARNING level)
-  - _mux_frames: log frame count before mux so strategy-3 failures
-    are diagnosable ("0 frames captured" vs "mux failed")
-  - All strategies: on_error now called on subprocess.OSError too
-    (e.g. ffmpeg binary found but not executable on this arch)
-
-Video recording fixes (v1.0.2):
-  - _open_fb() called inside run() so per-thread HiSilicon fb1 fallback
-    is applied before the capture loop starts
-  - Interruptible sleep via stop_event.wait()
-  - makedirs_safe() used on ALL code paths
-  - on_error receives 'ExceptionType: msg' string
-  - FFmpeg stderr redirected to /tmp/ffmpeg_e2rec.log
-
-Video recording fixes (v1.0.1):
-  - Mux runs strictly AFTER stop_event fires
-  - communicate_safe() for Py2/Py3 timeout compatibility
-  - Ring-buffer re-index before mux
+The recorder runs in a daemon thread.  UI communicates via:
+  - stop()       : signal the thread to finish
+  - is_alive()   : check if still running  (threading.Thread builtin)
+  - elapsed()    : seconds since start (for WebIF REC timer)
 """
 from __future__ import absolute_import, print_function, division
 
-import threading
-import time
 import os
-import shutil
-import subprocess
+import sys
+import time
+import threading
+import zipfile
 
 from .framebuffer import FramebufferCapture
 from .converter   import PixelConverter
-from .compat      import communicate_safe, makedirs_safe
+from ..utils.logger import log
 
 try:
     from PIL import Image
@@ -51,13 +30,25 @@ try:
 except ImportError:
     HAS_PIL = False
 
-RING_SIZE   = 30
-FFMPEG_LOG  = "/tmp/ffmpeg_e2rec.log"
+# Ring-buffer limit for low-RAM mode (≤256 MB devices)
+_RING_BUFFER_MAX = 30
 
 
 class FrameRecorder(threading.Thread):
+    """
+    Background recording thread.
 
-    def __init__(self, output_path, fps=5, fmt="mp4",
+    Parameters
+    ----------
+    output_path : str   destination file path
+    fps         : int   target capture rate
+    fmt         : str   container format hint (mp4/mkv/avi/ts)
+    fb_device   : str|None  /dev/fb0 or /dev/fb1; None = auto-detect
+    on_error    : callable(str) | None
+    low_ram     : bool  enable ring-buffer frame cap for <256 MB devices
+    """
+
+    def __init__(self, output_path, fps=5, fmt="mkv",
                  fb_device=None, on_error=None, low_ram=False):
         super(FrameRecorder, self).__init__()
         self.daemon      = True
@@ -67,420 +58,194 @@ class FrameRecorder(threading.Thread):
         self.fb_device   = fb_device
         self.on_error    = on_error
         self.low_ram     = low_ram
+
         self._stop_event = threading.Event()
         self._start_time = time.time()
-        self._frame_list = []
-        self._fb_info    = {}
-        self._tmp_dir    = None
+        self._ffmpeg_rec = None   # hold reference for stop()
 
     def stop(self):
+        """Signal the recording thread to finish."""
         self._stop_event.set()
+        # Also stop ffmpeg immediately if Strategy 1 is running
+        if self._ffmpeg_rec is not None:
+            try:
+                self._ffmpeg_rec.stop()
+            except Exception:
+                pass
 
     def elapsed(self):
+        """Return elapsed seconds since recording started (float)."""
         return time.time() - self._start_time
 
-    def _emit_error(self, msg):
-        """Send error to UI callback and write to log."""
+    # ── Main thread entry ──────────────────────────────────────────────────
+
+    def run(self):
+        self._start_time = time.time()
         try:
-            with open(FFMPEG_LOG, "a") as f:
-                f.write("[recorder error] {}\n".format(msg))
-        except Exception:
-            pass
-        if callable(self.on_error):
-            self.on_error(msg)
+            if self._try_ffmpeg_live():
+                return   # Strategy 1 handled everything
+            self._run_frame_fallback()   # Strategy 2 / 3
+        except Exception as e:
+            log.error("FrameRecorder.run exception: {}".format(e))
+            if callable(self.on_error):
+                self.on_error(str(e))
 
-    # ── Framebuffer open with HiSilicon blank-frame detection ─────────────
+    # ── Strategy 1: FFmpeg fbdev live capture ──────────────────────────────
 
-    def _open_fb(self):
-        primary    = self.fb_device or "/dev/fb0"
-        candidates = [primary]
-        if primary == "/dev/fb0" and os.path.exists("/dev/fb1"):
-            candidates.append("/dev/fb1")
-        elif primary == "/dev/fb1" and os.path.exists("/dev/fb0"):
-            candidates.append("/dev/fb0")
+    def _try_ffmpeg_live(self):
+        """
+        Attempt direct live capture via `ffmpeg -f fbdev`.
 
-        for dev in candidates:
+        Returns True if ffmpeg was found and the recording session
+        completed (or was stopped).  Returns False if ffmpeg is
+        unavailable so the caller can fall back to Strategy 2.
+        """
+        try:
+            from ..backends.GrabberFFmpeg import FFmpegRecorder, get_ffmpeg
+        except ImportError:
+            log.warning("GrabberFFmpeg import failed — using frame fallback")
+            return False
+
+        if not get_ffmpeg():
+            log.info("ffmpeg not found — using frame fallback")
+            return False
+
+        device = self.fb_device or self._auto_detect_fb()
+        log.info("Strategy 1: ffmpeg fbdev live → {} (device={})".format(
+            self.output_path, device))
+
+        rec = FFmpegRecorder(
+            output_path=self.output_path,
+            fps=self.fps,
+            fb_device=device,
+        )
+        self._ffmpeg_rec = rec
+        rec.start()
+
+        # Block until stop() is called or ffmpeg dies on its own
+        while not self._stop_event.is_set():
+            if not rec.is_running():
+                log.warning("ffmpeg exited unexpectedly")
+                break
+            time.sleep(0.5)
+
+        rec.stop()
+        self._ffmpeg_rec = None
+        log.info("Strategy 1 success: {}".format(self.output_path))
+        return True
+
+    # ── Strategy 2 / 3: frame-by-frame PNG capture ────────────────────────
+
+    def _auto_detect_fb(self):
+        """
+        Try /dev/fb0 first.  If the first 256 bytes are all zero (blank),
+        fall back to /dev/fb1 (HiSilicon / some BCM boxes).
+        """
+        for dev in ("/dev/fb0", "/dev/fb1"):
             if not os.path.exists(dev):
                 continue
             try:
-                fb = FramebufferCapture(device=dev)
-                fb.open()
-                os.lseek(fb._fd, 0, os.SEEK_SET)
-                sample  = os.read(fb._fd, 256)
-                nonzero = sum(1 for b in bytearray(sample) if b != 0)
-                if nonzero < 8 and dev == "/dev/fb0":
-                    fb.close()
-                    continue
-                return fb
-            except OSError:
-                continue
-
-        fb = FramebufferCapture(device=candidates[0])
-        fb.open()
-        return fb
-
-    # ── Main thread loop ─────────────────────────────────────────────────
-
-    def run(self):
-        fb = None
-        try:
-            fb = self._open_fb()
-            info = fb.get_info()
-            self._fb_info = info
-            w, h = info["xres"], info["yres"]
-            fb.close()
-            fb = None
-
-            if self._try_ffmpeg_direct(info):
-                return
-            if self._try_grab_pipe(info):
-                return
-            self._run_frame_dump(info, w, h)
-
-        except Exception as e:
-            self._emit_error("{}: {}".format(type(e).__name__, e))
-        finally:
-            if fb is not None:
-                try:
-                    fb.close()
-                except Exception:
-                    pass
-
-    # ── Strategy 1: FFmpeg rawvideo direct from /dev/fb ──────────────────
-
-    def _try_ffmpeg_direct(self, info):
-        from ..backends.GrabberFFmpeg import get_ffmpeg
-        ffmpeg = get_ffmpeg()
-        if not ffmpeg:
-            self._log("Strategy 1 skipped: ffmpeg not found in PATH")
-            return False
-
-        # FIX v1.0.3: probe the binary before trusting it
-        try:
-            probe = subprocess.Popen(
-                [ffmpeg, "-version"],
-                stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-            communicate_safe(probe, timeout=5)
-            if probe.returncode not in (0, 1):
-                self._log("Strategy 1 skipped: ffmpeg -version returned {}".format(
-                    probe.returncode))
-                return False
-        except Exception as probe_err:
-            self._log("Strategy 1 skipped: ffmpeg probe failed: {}".format(probe_err))
-            return False
-
-        w       = info["xres"]
-        h       = info["yres"]
-        bpp     = info["bpp"]
-        yoffset = info.get("yoffset", 0)
-        device  = self.fb_device or "/dev/fb0"
-
-        ro = info.get("red_offset", 16)
-        if bpp == 32:
-            pix_fmt = "bgra" if ro == 16 else "rgba"
-        elif bpp == 16:
-            pix_fmt = "rgb565le"
-        else:
-            self._log("Strategy 1 skipped: unsupported bpp={}".format(bpp))
-            return False
-
-        vf_filter = "crop={}:{}:0:{}".format(w, h, yoffset) if yoffset > 0 \
-                    else "crop={}:{}:0:0".format(w, h)
-        fb_height = info.get("yres", h)
-
-        cmd = [
-            ffmpeg,
-            "-loglevel", "warning",
-            "-f", "rawvideo",
-            "-pixel_format", pix_fmt,
-            "-video_size", "{}x{}".format(w, fb_height),
-            "-framerate", str(self.fps),
-            "-i", device,
-            "-vf", vf_filter,
-            "-c:v", "libx264",
-            "-preset", "ultrafast",
-            "-crf", "28",
-            "-pix_fmt", "yuv420p",
-            "-t", "3600",
-            "-y",
-            self.output_path,
-        ]
-
-        self._log("Strategy 1 start: {}".format(" ".join(cmd)))
-
-        try:
-            log_fd = open(FFMPEG_LOG, "w")
-        except Exception:
-            log_fd = subprocess.PIPE
-
-        try:
-            proc = subprocess.Popen(
-                cmd,
-                stdin=subprocess.PIPE,
-                stdout=log_fd,
-                stderr=subprocess.STDOUT,
-            )
-
-            while not self._stop_event.is_set():
-                self._stop_event.wait(0.5)
-                if proc.poll() is not None:
-                    break
-
-            # Graceful shutdown
-            try:
-                proc.stdin.write(b"q\n")
-                proc.stdin.flush()
-            except Exception:
-                pass
-            proc.terminate()
-
-            try:
-                communicate_safe(proc, timeout=30)
-            except Exception:
-                pass
-
-            # FIX v1.0.3: surface non-zero exit code to the UI
-            rc = proc.returncode if proc.returncode is not None else -1
-            if rc not in (0, -15, 255):  # 0=ok, -15=SIGTERM, 255=ffmpeg ctrl+c
-                err_snippet = self._tail_log(FFMPEG_LOG)
-                self._emit_error(
-                    "ffmpeg exited {} — {}".format(rc, err_snippet))
-
-            if (os.path.isfile(self.output_path)
-                    and os.path.getsize(self.output_path) > 1024):
-                self._log("Strategy 1 success: {}".format(self.output_path))
-                return True
-
-            try:
-                os.remove(self.output_path)
-            except Exception:
-                pass
-            self._log("Strategy 1 produced empty file — falling through")
-            return False
-
-        except Exception as e:
-            self._emit_error("Strategy 1 exception: {}: {}".format(
-                type(e).__name__, e))
-            return False
-        finally:
-            try:
-                log_fd.close()
-            except Exception:
-                pass
-
-    # ── Strategy 2: grab-per-frame JPEG pipe ─────────────────────────────
-
-    def _try_grab_pipe(self, info):
-        from ..backends.GrabberFFmpeg import get_ffmpeg
-        from .framebuffer import GRAB_BINS
-        ffmpeg = get_ffmpeg()
-        if not ffmpeg:
-            return False
-
-        grab_bin = None
-        for b in GRAB_BINS:
-            try:
-                ret = subprocess.call(
-                    [b, "--help"] if os.sep not in b else [b],
-                    stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-                if ret in (0, 1):
-                    grab_bin = b
-                    break
+                fd = os.open(dev, os.O_RDONLY)
+                sample = os.read(fd, 256)
+                os.close(fd)
+                if any(b != 0 for b in bytearray(sample)):
+                    log.info("Auto-detected framebuffer: {}".format(dev))
+                    return dev
             except Exception:
                 continue
-        if not grab_bin:
-            return False
+        log.warning("Could not auto-detect FB device, defaulting to /dev/fb0")
+        return "/dev/fb0"
 
-        tmp_dir = "/tmp/e2rec_grab_{}".format(os.getpid())
-        makedirs_safe(tmp_dir)
+    def _run_frame_fallback(self):
+        """Capture individual PNG frames then mux or ZIP them."""
+        device  = self.fb_device or self._auto_detect_fb()
+        fb      = FramebufferCapture(device=device)
+        try:
+            fb.open()
+        except Exception as e:
+            raise RuntimeError("Cannot open {}: {}".format(device, e))
 
-        delay       = 1.0 / max(1, self.fps)
-        idx         = 0
+        info    = fb.get_info()
+        w, h    = info["xres"], info["yres"]
+        delay   = 1.0 / self.fps
+        idx     = 0
+        tmp_dir = "/tmp/e2rec_{}".format(os.getpid())
+
+        try:
+            os.makedirs(tmp_dir)
+        except OSError:
+            pass
+
         frame_paths = []
 
-        while not self._stop_event.is_set():
-            t0         = time.time()
-            frame_path = "{}/{:06d}.jpg".format(tmp_dir, idx)
-            try:
-                ret = subprocess.call(
-                    [grab_bin, "-j", "85", frame_path],
-                    stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-                if ret == 0 and os.path.isfile(frame_path):
-                    frame_paths.append(frame_path)
-            except Exception:
-                pass
-            idx += 1
-            self._stop_event.wait(max(0.0, delay - (time.time() - t0)))
-
-        if not frame_paths:
-            return False
-
-        list_path = "{}/concat.txt".format(tmp_dir)
-        with open(list_path, "w") as f:
-            for fp in frame_paths:
-                f.write("file '{}'\n".format(fp))
-                f.write("duration {}\n".format(round(1.0 / self.fps, 4)))
-
-        cmd = [
-            ffmpeg, "-loglevel", "warning",
-            "-f", "concat", "-safe", "0",
-            "-i", list_path,
-            "-c:v", "libx264", "-preset", "ultrafast",
-            "-crf", "28", "-pix_fmt", "yuv420p",
-            "-y", self.output_path,
-        ]
-        proc = subprocess.Popen(cmd, stdout=subprocess.PIPE,
-                                stderr=subprocess.PIPE)
         try:
-            communicate_safe(proc, timeout=120)
-        except Exception:
-            pass
-
-        ok = (os.path.isfile(self.output_path)
-              and os.path.getsize(self.output_path) > 1024)
-        try:
-            shutil.rmtree(tmp_dir, ignore_errors=True)
-        except Exception:
-            pass
-        return ok
-
-    # ── Strategy 3: frame-dump + mux ─────────────────────────────────────
-
-    def _run_frame_dump(self, info, w, h):
-        tmp_dir = "/tmp/e2rec_{}".format(os.getpid())
-        self._tmp_dir = tmp_dir
-        makedirs_safe(tmp_dir)
-
-        fb = FramebufferCapture(self.fb_device)
-        fb.open()
-        delay = 1.0 / max(1, self.fps)
-        idx   = 0
-
-        while not self._stop_event.is_set():
-            t0 = time.time()
-            try:
+            while not self._stop_event.is_set():
+                t0  = time.time()
                 raw = fb.capture_raw()
                 rgb = PixelConverter.to_rgb24(raw, info)
-                frame_path = "{}/{:06d}.png".format(tmp_dir, idx)
+                frame_path = os.path.join(tmp_dir, "{:06d}.png".format(idx))
                 self._write_frame(rgb, w, h, frame_path)
 
-                self._frame_list.append(frame_path)
-                if self.low_ram and len(self._frame_list) > RING_SIZE:
-                    old = self._frame_list.pop(0)
-                    try:
-                        os.remove(old)
-                    except OSError:
-                        pass
+                if self.low_ram:
+                    # Ring buffer: discard oldest frame when over limit
+                    frame_paths.append(frame_path)
+                    if len(frame_paths) > _RING_BUFFER_MAX:
+                        old = frame_paths.pop(0)
+                        try:
+                            os.remove(old)
+                        except Exception:
+                            pass
+                else:
+                    frame_paths.append(frame_path)
 
                 idx += 1
-            except Exception:
-                pass
+                elapsed = time.time() - t0
+                time.sleep(max(0.0, delay - elapsed))
+        finally:
+            fb.close()
 
-            self._stop_event.wait(max(0.0, delay - (time.time() - t0)))
-
-        fb.close()
-        self._mux_frames(tmp_dir, w, h)
+        log.info("Frame capture done: {} frames".format(len(frame_paths)))
+        self._mux_or_zip(frame_paths, tmp_dir)
 
     def _write_frame(self, rgb24, w, h, path):
         if HAS_PIL:
-            try:
-                Image.frombytes("RGB", (w, h), rgb24).save(
-                    path, "PNG", optimize=False, compress_level=1)
-                return
-            except Exception:
-                pass
-        from ..backends.GrabberPPM import PPMGrabber
-        PPMGrabber.save_png(rgb24, w, h, path)
+            Image.frombytes("RGB", (w, h), rgb24).save(path)
+        else:
+            from ..backends.GrabberPPM import PPMGrabber
+            PPMGrabber.save_png(rgb24, w, h, path)
 
-    def _mux_frames(self, tmp_dir, w, h):
-        from ..backends.GrabberFFmpeg import get_ffmpeg
-        ffmpeg = get_ffmpeg()
+    def _mux_or_zip(self, frame_paths, tmp_dir):
+        """Strategy 2: mux with ffmpeg.  Strategy 3: ZIP fallback."""
+        try:
+            from ..backends.GrabberFFmpeg import get_ffmpeg
+            binary = get_ffmpeg()
+        except ImportError:
+            binary = None
 
-        sequential = [f for f in self._frame_list if os.path.isfile(f)]
-
-        # FIX v1.0.3: log frame count so "0 frames" is diagnosable
-        self._log("Strategy 3 mux: {} frames captured".format(len(sequential)))
-
-        if not sequential:
-            self._emit_error("No frames captured — check /dev/fb0 permissions")
-            return
-
-        if ffmpeg:
-            for new_idx, old_path in enumerate(sequential):
-                new_path = "{}/mux_{:06d}.png".format(tmp_dir, new_idx)
-                if old_path != new_path:
-                    try:
-                        os.rename(old_path, new_path)
-                    except Exception:
-                        pass
-
-            try:
-                log_fd = open(FFMPEG_LOG, "w")
-            except Exception:
-                log_fd = subprocess.PIPE
-
+        if binary and frame_paths:
+            import subprocess
             cmd = [
-                ffmpeg,
-                "-loglevel", "warning",
+                binary,
                 "-framerate", str(self.fps),
-                "-i", "{}/mux_%06d.png".format(tmp_dir),
+                "-i", os.path.join(tmp_dir, "%06d.png"),
                 "-c:v", "libx264",
-                "-preset", "ultrafast",
-                "-crf", "28",
                 "-pix_fmt", "yuv420p",
-                "-movflags", "+faststart",
+                "-crf", "28",
+                "-preset", "ultrafast",
                 "-y", self.output_path,
             ]
-            proc = subprocess.Popen(cmd, stdout=log_fd,
-                                    stderr=subprocess.STDOUT)
-            try:
-                communicate_safe(proc, timeout=300)
-            except Exception as e:
-                self._emit_error("FFmpeg mux error: {}".format(e))
-            finally:
-                try:
-                    log_fd.close()
-                except Exception:
-                    pass
+            log.info("Strategy 2 mux: {}".format(" ".join(cmd)))
+            ret = subprocess.call(cmd)
+            if ret == 0:
+                log.info("Strategy 2 success: {}".format(self.output_path))
+                return
+            log.warning("Strategy 2 mux failed (exit {}), falling to ZIP".format(ret))
 
-            # FIX v1.0.3: surface mux failure to UI
-            rc = proc.returncode if proc.returncode is not None else -1
-            if rc not in (0, -15, 255):
-                err_snippet = self._tail_log(FFMPEG_LOG)
-                self._emit_error("Mux exited {} — {}".format(rc, err_snippet))
-
-        if (not ffmpeg
-                or not os.path.isfile(self.output_path)
-                or os.path.getsize(self.output_path) < 1024):
-            import zipfile
-            zip_path = self.output_path.rsplit(".", 1)[0] + "_frames.zip"
-            self._log("Strategy 4 fallback: writing {}".format(zip_path))
-            with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zf:
-                for fp in sequential:
-                    if os.path.isfile(fp):
-                        zf.write(fp, os.path.basename(fp))
-
-        try:
-            shutil.rmtree(tmp_dir, ignore_errors=True)
-        except Exception:
-            pass
-
-    # ── Helpers ───────────────────────────────────────────────────────────
-
-    def _log(self, msg):
-        """Append a timestamped line to the ffmpeg log for diagnostics."""
-        try:
-            with open(FFMPEG_LOG, "a") as f:
-                f.write("[{:.1f}] {}\n".format(time.time(), msg))
-        except Exception:
-            pass
-
-    @staticmethod
-    def _tail_log(path, lines=3):
-        """Return the last N lines of a log file as a single string."""
-        try:
-            with open(path, "r") as f:
-                tail = f.readlines()[-lines:]
-            return " | ".join(l.strip() for l in tail if l.strip())
-        except Exception:
-            return "(no log)"
+        # Strategy 3: ZIP archive of PNG frames
+        zip_path = self.output_path.rsplit(".", 1)[0] + "_frames.zip"
+        log.info("Strategy 3: saving frames as ZIP → {}".format(zip_path))
+        with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zf:
+            for fp in frame_paths:
+                if os.path.isfile(fp):
+                    zf.write(fp, os.path.basename(fp))
+        log.info("Strategy 3 done: {}".format(zip_path))
