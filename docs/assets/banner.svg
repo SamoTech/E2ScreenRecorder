@@ -1,0 +1,109 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1280" height="320" viewBox="0 0 1280 320">
+  <defs>
+    <linearGradient id="bg" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#06080f"/>
+      <stop offset="100%" stop-color="#0c0e1a"/>
+    </linearGradient>
+    <linearGradient id="acc" x1="0%" y1="0%" x2="100%" y2="0%">
+      <stop offset="0%" stop-color="#2979ff"/>
+      <stop offset="100%" stop-color="#82b1ff"/>
+    </linearGradient>
+    <linearGradient id="acc2" x1="0%" y1="0%" x2="100%" y2="0%">
+      <stop offset="0%" stop-color="#e53935"/>
+      <stop offset="100%" stop-color="#ff8a80"/>
+    </linearGradient>
+    <pattern id="dot" width="22" height="22" patternUnits="userSpaceOnUse">
+      <circle cx="11" cy="11" r="1" fill="#0e1020"/>
+    </pattern>
+    <filter id="glow">
+      <feGaussianBlur stdDeviation="6" result="b"/>
+      <feMerge><feMergeNode in="b"/><feMergeNode in="SourceGraphic"/></feMerge>
+    </filter>
+  </defs>
+
+  <!-- Background -->
+  <rect width="1280" height="320" fill="url(#bg)"/>
+  <rect width="1280" height="320" fill="url(#dot)"/>
+  <!-- Left accent bar -->
+  <rect x="0" y="0" width="4" height="320" fill="url(#acc)"/>
+
+  <!-- Screen/Record icon (left) -->
+  <g transform="translate(72, 84)" filter="url(#glow)">
+    <rect x="0" y="0" width="120" height="120" rx="20" fill="#06080f" stroke="url(#acc)" stroke-width="2.5"/>
+    <!-- Monitor frame -->
+    <rect x="14" y="18" width="92" height="62" rx="6" fill="none" stroke="url(#acc)" stroke-width="2"/>
+    <!-- Screen interior -->
+    <rect x="18" y="22" width="84" height="54" rx="4" fill="#0e1325"/>
+    <!-- Scanlines -->
+    <line x1="18" y1="32" x2="102" y2="32" stroke="#2979ff" stroke-width="0.5" opacity="0.3"/>
+    <line x1="18" y1="42" x2="102" y2="42" stroke="#2979ff" stroke-width="0.5" opacity="0.3"/>
+    <line x1="18" y1="52" x2="102" y2="52" stroke="#2979ff" stroke-width="0.5" opacity="0.3"/>
+    <line x1="18" y1="62" x2="102" y2="62" stroke="#2979ff" stroke-width="0.5" opacity="0.3"/>
+    <!-- REC indicator -->
+    <circle cx="32" cy="38" r="6" fill="url(#acc2)"/>
+    <rect x="41" y="34" width="28" height="8" rx="2" fill="#e53935" opacity="0.2"/>
+    <text x="55" y="41" font-family="monospace" font-size="8" fill="#ff8a80" text-anchor="middle" font-weight="bold">REC</text>
+    <!-- Progress bar -->
+    <rect x="20" y="60" width="80" height="6" rx="3" fill="#1a1f3a"/>
+    <rect x="20" y="60" width="52" height="6" rx="3" fill="url(#acc)"/>
+    <!-- Monitor stand -->
+    <line x1="60" y1="80" x2="60" y2="94" stroke="url(#acc)" stroke-width="2" stroke-linecap="round"/>
+    <rect x="42" y="94" width="36" height="6" rx="3" fill="none" stroke="url(#acc)" stroke-width="2"/>
+    <!-- Format badges -->
+    <rect x="14" y="100" width="36" height="14" rx="4" fill="#2979ff" fill-opacity="0.15"/>
+    <text x="32" y="111" font-family="monospace" font-size="8" fill="#82b1ff" text-anchor="middle">MP4</text>
+    <rect x="54" y="100" width="36" height="14" rx="4" fill="#e53935" fill-opacity="0.15"/>
+    <text x="72" y="111" font-family="monospace" font-size="8" fill="#ff8a80" text-anchor="middle">PNG</text>
+  </g>
+
+  <!-- Wordmark -->
+  <text x="226" y="104" font-family="'SF Mono',Consolas,monospace" font-size="12" fill="#2979ff" opacity="0.65" letter-spacing="5">ENIGMA2 · SAMOTECH</text>
+  <text x="222" y="174" font-family="Arial Black,'Arial Bold',sans-serif" font-size="68" font-weight="900" letter-spacing="-2" fill="#eef2ff">E2Screen</text>
+  <text x="222" y="224" font-family="Arial Black,'Arial Bold',sans-serif" font-size="56" font-weight="900" letter-spacing="-1" fill="url(#acc)">Recorder</text>
+
+  <!-- Divider -->
+  <rect x="224" y="236" width="480" height="2" fill="url(#acc)" opacity="0.4"/>
+
+  <!-- Tagline -->
+  <text x="224" y="260" font-family="monospace" font-size="14" fill="#5a6a9e">Full-featured Enigma2 plugin — Screenshots &amp; Video from /dev/fb0 · Python 2.7–3.12+</text>
+
+  <!-- Feature pills -->
+  <rect x="224" y="274" width="112" height="26" rx="13" fill="#2979ff" fill-opacity="0.12"/>
+  <text x="280" y="292" font-family="monospace" font-size="12" fill="#82b1ff" text-anchor="middle">MP4 / AVI</text>
+
+  <rect x="348" y="274" width="130" height="26" rx="13" fill="#e53935" fill-opacity="0.12"/>
+  <text x="413" y="292" font-family="monospace" font-size="12" fill="#ff8a80" text-anchor="middle">PNG / JPEG / BMP</text>
+
+  <rect x="490" y="274" width="110" height="26" rx="13" fill="#2979ff" fill-opacity="0.10"/>
+  <text x="545" y="292" font-family="monospace" font-size="12" fill="#82b1ff" text-anchor="middle">Built-in WebIF</text>
+
+  <rect x="612" y="274" width="110" height="26" rx="13" fill="#e53935" fill-opacity="0.10"/>
+  <text x="667" y="292" font-family="monospace" font-size="12" fill="#ff8a80" text-anchor="middle">Zero Deps</text>
+
+  <!-- Right: STB + framebuffer diagram -->
+  <g opacity="0.18" transform="translate(856, 46)">
+    <!-- STB box -->
+    <rect x="120" y="80" width="130" height="60" rx="10" fill="#0c0e1a" stroke="#2979ff" stroke-width="1.5"/>
+    <text x="185" y="108" font-family="monospace" font-size="11" fill="#82b1ff" text-anchor="middle">Enigma2 STB</text>
+    <text x="185" y="124" font-family="monospace" font-size="9" fill="#3d4f8a" text-anchor="middle">/dev/fb0</text>
+    <!-- Power LED -->
+    <circle cx="136" cy="93" r="4" fill="#2979ff"/>
+    <!-- Arrow down to capture -->
+    <line x1="185" y1="140" x2="185" y2="164" stroke="#2979ff" stroke-width="1.2"/>
+    <polygon points="185,168 180,160 190,160" fill="#2979ff"/>
+    <!-- Capture engine box -->
+    <rect x="110" y="168" width="150" height="44" rx="8" fill="#0c0e1a" stroke="#82b1ff" stroke-width="1.2"/>
+    <text x="185" y="188" font-family="monospace" font-size="10" fill="#82b1ff" text-anchor="middle">Capture Engine</text>
+    <text x="185" y="203" font-family="monospace" font-size="9" fill="#3d4f8a" text-anchor="middle">Python 2.7 – 3.12</text>
+    <!-- Output files -->
+    <rect x="68" y="238" width="72" height="28" rx="6" fill="#0c0e1a" stroke="#2979ff" stroke-width="1"/>
+    <text x="104" y="257" font-family="monospace" font-size="9" fill="#82b1ff" text-anchor="middle">video.mp4</text>
+    <line x1="155" y1="212" x2="104" y2="238" stroke="#2979ff" stroke-width="1" stroke-dasharray="4 3"/>
+    <rect x="230" y="238" width="72" height="28" rx="6" fill="#0c0e1a" stroke="#e53935" stroke-width="1"/>
+    <text x="266" y="257" font-family="monospace" font-size="9" fill="#ff8a80" text-anchor="middle">screen.png</text>
+    <line x1="215" y1="212" x2="266" y2="238" stroke="#e53935" stroke-width="1" stroke-dasharray="4 3"/>
+  </g>
+
+  <!-- Stack label -->
+  <text x="224" y="312" font-family="monospace" font-size="12" fill="#2d3a6a">Python · /dev/fb0 framebuffer · WebIF · All STB SoC families</text>
+</svg>
