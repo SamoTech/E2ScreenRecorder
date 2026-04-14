@@ -1,6 +1,6 @@
 # E2ScreenRecorder
 
-![Banner](docs/assets/banner.svg)
+![Banner](assets/banner.svg)
 
 > Capture screenshots and record screen video directly from your Enigma2
 > set-top box. Works on every known device and image. Zero mandatory dependencies.
